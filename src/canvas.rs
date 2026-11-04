@@ -239,6 +239,19 @@ impl Canvas {
         }
     }
 
+    /// Batasi gambar berikutnya ke kotak ini (sampai `reset_clip`).
+    pub fn clip(&self, x: f32, y: f32, w: f32, h: f32) {
+        unsafe {
+            GdipSetClipRect(self.gfx, x, y, w, h, CombineModeReplace);
+        }
+    }
+
+    pub fn reset_clip(&self) {
+        unsafe {
+            GdipResetClip(self.gfx);
+        }
+    }
+
     /// Persegi panjang dengan radius sudut berbeda: (kiri-atas, kanan-atas, kanan-bawah, kiri-bawah).
     pub fn fill_round_rect(&self, x: f32, y: f32, w: f32, h: f32, r: (f32, f32, f32, f32), color: u32) {
         self.fill_path(Self::rr_path(x, y, w, h, r), color);

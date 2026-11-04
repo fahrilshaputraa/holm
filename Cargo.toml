@@ -7,11 +7,15 @@ edition = "2021"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 toml = "1.1.8"
+toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_System_DataExchange",
+    "Win32_System_ApplicationInstallationAndServicing",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_GdiPlus",
     "Win32_Graphics_Direct2D",

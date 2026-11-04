@@ -12,6 +12,7 @@ mod notch;
 mod notifications;
 mod popup;
 mod radios;
+mod settings;
 mod status;
 mod taskbar;
 
@@ -32,6 +33,7 @@ pub const IDM_OPEN_CONFIG: usize = 1001;
 pub const IDM_RELOAD: usize = 1002;
 pub const IDM_EXIT: usize = 1003;
 const IDM_PREVIEW_NOTIF: usize = 1004;
+pub const IDM_SETTINGS: usize = 1005;
 
 const TIMER_TICK: usize = 1;
 const TICK_MS: u32 = 15_000;
@@ -39,11 +41,15 @@ const TICK_MS: u32 = 15_000;
 /// Pesan thread (hwnd kosong) yang ditangani di message loop.
 const WM_FOREGROUND: u32 = WM_APP + 2;
 const WM_REBUILD: u32 = WM_APP + 10;
+/// Dikirim instance kedua ke jendela IPC: buka Pengaturan.
+const WM_OPEN_SETTINGS: u32 = WM_APP + 11;
+const IPC_CLASS: PCWSTR = w!("HolmBarIpcClass");
 
 static MAIN_TID: AtomicU32 = AtomicU32::new(0);
 static REBUILD_PENDING: AtomicBool = AtomicBool::new(false);
 static QUITTING: AtomicBool = AtomicBool::new(false);
 static REBUILDING: AtomicBool = AtomicBool::new(false);
+static NOTIF_STARTED: AtomicBool = AtomicBool::new(false);
 static CONFIG_STAMP: std::sync::Mutex<Option<std::time::SystemTime>> = std::sync::Mutex::new(None);
 
 #[derive(Default)]
@@ -72,7 +78,8 @@ fn notches() -> Vec<HWND> {
 pub fn show_menu(owner: HWND) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
-        let _ = AppendMenuW(menu, MF_STRING, IDM_OPEN_CONFIG, w!("Open config"));
+        let _ = AppendMenuW(menu, MF_STRING, IDM_SETTINGS, w!("Settings..."));
+        let _ = AppendMenuW(menu, MF_STRING, IDM_OPEN_CONFIG, w!("Open config file"));
         let _ = AppendMenuW(menu, MF_STRING, IDM_RELOAD, w!("Reload config"));
         let _ = AppendMenuW(menu, MF_STRING, IDM_PREVIEW_NOTIF, w!("Preview notification"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -80,8 +87,32 @@ pub fn show_menu(owner: HWND) {
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let _ = SetForegroundWindow(owner);
-        let _ = TrackPopupMenuEx(menu, TPM_RIGHTBUTTON.0, pt.x, pt.y, owner, None);
+        // TPM_RETURNCMD: menu juga dipanggil dari Dock/notch yang tidak menangani WM_COMMAND.
+        let cmd = TrackPopupMenuEx(menu, (TPM_RIGHTBUTTON | TPM_RETURNCMD).0, pt.x, pt.y, owner, None).0;
         let _ = DestroyMenu(menu);
+        if cmd > 0 {
+            handle_command(cmd as usize);
+        }
+    }
+}
+
+/// Perintah menu HolmBar (dari menu klik kanan atau menu logo Windows).
+pub fn handle_command(id: usize) {
+    match id {
+        IDM_SETTINGS => settings::open(),
+        IDM_OPEN_CONFIG => open_config(),
+        IDM_RELOAD => reload_config(),
+        IDM_PREVIEW_NOTIF => {
+            let t = notifications::Toast {
+                app: "HolmBar".into(),
+                title: "Contoh notifikasi".into(),
+                body: "Begini tampilan banner Windows di notch.".into(),
+                icon: None,
+            };
+            notches().into_iter().for_each(|h| notch::notify(h, t.clone()));
+        }
+        IDM_EXIT => quit(),
+        _ => {}
     }
 }
 
@@ -92,7 +123,7 @@ fn open_uri(uri: &str) {
     }
 }
 
-fn open_config() {
+pub(crate) fn open_config() {
     let e = wide("notepad.exe");
     let a = wide(&format!("\"{}\"", config::path().to_string_lossy()));
     unsafe {
@@ -237,10 +268,19 @@ fn register_hotkey() {
     }
 }
 
-fn reload_config() {
+/// Mulai pembaca notifikasi bila diaktifkan dan belum berjalan (sekali per proses).
+fn start_notifications() {
+    let n = &config::current().notifications;
+    if n.enabled && !NOTIF_STARTED.swap(true, Ordering::SeqCst) {
+        notifications::start(MAIN_TID.load(Ordering::Relaxed), n.poll_ms);
+    }
+}
+
+pub(crate) fn reload_config() {
     if config::reload().is_ok() {
         rebuild();
         register_hotkey();
+        start_notifications();
     }
     if let Ok(mut s) = CONFIG_STAMP.lock() {
         *s = config::mtime();
@@ -335,21 +375,7 @@ unsafe extern "system" fn bar_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             LRESULT(0)
         }
         WM_COMMAND => {
-            match wparam.0 & 0xFFFF {
-                IDM_OPEN_CONFIG => open_config(),
-                IDM_RELOAD => reload_config(),
-                IDM_PREVIEW_NOTIF => {
-                    let t = notifications::Toast {
-                        app: "HolmBar".into(),
-                        title: "Contoh notifikasi".into(),
-                        body: "Begini tampilan banner Windows di notch.".into(),
-                        icon: None,
-                    };
-                    notches().into_iter().for_each(|h| notch::notify(h, t.clone()));
-                }
-                IDM_EXIT => quit(),
-                _ => {}
-            }
+            handle_command(wparam.0 & 0xFFFF);
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -360,6 +386,30 @@ unsafe extern "system" fn bar_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// Jendela pesan tersembunyi agar instance kedua bisa meminta jendela Pengaturan dibuka.
+unsafe extern "system" fn ipc_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_OPEN_SETTINGS {
+        settings::open();
+        return LRESULT(0);
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+fn create_ipc_window() {
+    unsafe {
+        let Ok(hmod) = GetModuleHandleW(None) else { return };
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(ipc_wndproc),
+            hInstance: hmod.into(),
+            lpszClassName: IPC_CLASS,
+            ..Default::default()
+        };
+        RegisterClassExW(&wc);
+        let _ = CreateWindowExW(WINDOW_EX_STYLE(0), IPC_CLASS, w!("HolmBar IPC"), WINDOW_STYLE(0), 0, 0, 0, 0, Some(HWND_MESSAGE), None, Some(hmod.into()), None);
     }
 }
 
@@ -424,6 +474,11 @@ fn main() {
         // Satu instance saja.
         let _guard = CreateMutexW(None, false, w!("Local\\HolmBarSingleton"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
+            // Sudah berjalan: menjalankan HolmBar lagi membuka jendela Pengaturan.
+            if let Ok(h) = FindWindowExW(Some(HWND_MESSAGE), None, IPC_CLASS, PCWSTR::null()) {
+                let _ = AllowSetForegroundWindow(ASFW_ANY);
+                let _ = PostMessageW(Some(h), WM_OPEN_SETTINGS, WPARAM(0), LPARAM(0));
+            }
             return;
         }
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -433,6 +488,8 @@ fn main() {
         config::init();
         canvas::startup();
         register_classes();
+        settings::register();
+        create_ipc_window();
 
         *CONFIG_STAMP.lock().unwrap() = config::mtime();
         rebuild();
@@ -446,12 +503,7 @@ fn main() {
         register_hotkey();
         media::start(tid);
         status::start(tid);
-        {
-            let n = &config::current().notifications;
-            if n.enabled {
-                notifications::start(tid, n.poll_ms);
-            }
-        }
+        start_notifications();
         if bar::on_foreground(GetForegroundWindow()) {
             bars().into_iter().for_each(bar::redraw);
         }

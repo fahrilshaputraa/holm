@@ -24,6 +24,7 @@ enum Act {
     Exec(&'static str, &'static str),
     /// Tanya konfirmasi sebelum menjalankan perintah daya.
     Confirm(&'static str, &'static str, &'static str),
+    Settings,
     OpenConfig,
     ReloadConfig,
     QuitApp,
@@ -63,6 +64,7 @@ fn start_items() -> Vec<Item> {
         it("Restart...", "", Act::Confirm("Restart komputer sekarang? Pekerjaan yang belum disimpan bisa hilang.", "shutdown.exe", "/r /t 0")),
         it("Shut Down...", "", Act::Confirm("Matikan komputer sekarang? Pekerjaan yang belum disimpan bisa hilang.", "shutdown.exe", "/s /t 0")),
         SEP,
+        it("HolmBar Settings...", "", Act::Settings),
         it("Open HolmBar Config", "", Act::OpenConfig),
         it("Reload Config", "", Act::ReloadConfig),
         it("Quit HolmBar", "", Act::QuitApp),
@@ -183,6 +185,9 @@ fn run(act: Act, owner: HWND, target: Option<HWND>) {
                 shell(f, a, SW_HIDE);
             }
         }
+        Act::Settings => unsafe {
+            let _ = PostMessageW(Some(owner), WM_COMMAND, WPARAM(crate::IDM_SETTINGS), LPARAM(0));
+        },
         Act::OpenConfig => unsafe {
             let _ = PostMessageW(Some(owner), WM_COMMAND, WPARAM(crate::IDM_OPEN_CONFIG), LPARAM(0));
         },

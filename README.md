@@ -6,6 +6,8 @@ Taskbar Windows disembunyikan lalu dipulihkan saat aplikasi keluar.
 - Menu bar: logo Windows, nama aplikasi aktif, menu, Wi-Fi, volume, Bluetooth, baterai, jam (kalender saat diklik).
 - Notch: kontrol media dengan sampul, lirik tersinkron (lrclib.net), dan banner notifikasi Windows.
 - Dock: aplikasi tersemat (termasuk pin taskbar) dan yang berjalan, magnifikasi, tombol Windows.
+- Jendela **Pengaturan**: klik kanan bar/Dock → *Settings...*, menu logo Windows → *HolmBar Settings...*,
+  atau jalankan HolmBar sekali lagi. Perubahan langsung diterapkan dan ditulis ke config.toml tanpa menghapus komentar.
 - Konfigurasi TOML di `%APPDATA%\HolmBar\config.toml`, dimuat ulang otomatis.
 
 ## Build

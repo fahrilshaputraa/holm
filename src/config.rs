@@ -140,14 +140,29 @@ fn merge(base: &mut toml::Value, over: toml::Value) {
     }
 }
 
-/// Nilai bawaan + file pengguna (digabung per-kunci). Error -> pesan untuk ditampilkan.
-pub fn load() -> Result<Config, String> {
+/// Nilai bawaan digabung dengan teks config pengguna (bila ada).
+fn merged_from(user_text: Option<&str>) -> Result<toml::Value, String> {
     let mut merged: toml::Value = toml::from_str(DEFAULT_TOML).map_err(|e| e.to_string())?;
-    if let Ok(text) = std::fs::read_to_string(path()) {
-        let user: toml::Value = toml::from_str(&text).map_err(|e| e.to_string())?;
+    if let Some(text) = user_text {
+        let user: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
         merge(&mut merged, user);
     }
-    merged.try_into::<Config>().map_err(|e| e.to_string())
+    Ok(merged)
+}
+
+/// Nilai efektif (bawaan + file pengguna) sebagai pohon TOML, untuk dialog pengaturan.
+pub fn merged_value() -> Result<toml::Value, String> {
+    merged_from(std::fs::read_to_string(path()).ok().as_deref())
+}
+
+/// Pastikan teks config pengguna valid sebelum ditulis ke disk.
+pub fn validate(user_text: &str) -> Result<(), String> {
+    merged_from(Some(user_text))?.try_into::<Config>().map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Nilai bawaan + file pengguna (digabung per-kunci). Error -> pesan untuk ditampilkan.
+pub fn load() -> Result<Config, String> {
+    merged_value()?.try_into::<Config>().map_err(|e| e.to_string())
 }
 
 /// Muat ulang; jika gagal, konfigurasi lama dipertahankan dan error dikembalikan.
