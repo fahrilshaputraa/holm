@@ -1,11 +1,13 @@
 //! Notch / dynamic island ala MacBook di tengah atas layar.
-//! - Bentuk menyatu dengan menu bar (telinga cekung di kiri/kanan atas).
-//! - Animasi spring (sedikit memantul) saat membuka/menutup.
-//! - Terbuka: sampul, judul/artis, lirik tersinkron, progres (klik untuk seek), kontrol.
-//! Timer hanya hidup saat ada animasi, atau saat terbuka + musik diputar (untuk progres/lirik).
+//! - Bentuk "notch" (menyatu dengan bar, telinga cekung) atau "pill" (pulau melayang).
+//! - Ringkas: live activity (sampul + visualizer musik, timer yang berjalan).
+//! - Terbuka: tab Media, Kalender, Timer/Stopwatch, Sistem; ikon tab di strip atas, ⚙ ke Pengaturan.
+//! - Animasi spring (sedikit memantul) saat membuka/menutup; kartu notifikasi Windows.
+//! Timer gambar ulang hanya hidup saat ada yang bergerak (lihat `sync_tick`).
 
 use crate::canvas::{Align, Canvas, Font, Image};
 use crate::config;
+use crate::icons::{self, Icon};
 use crate::lyrics::{self, Lyrics};
 use crate::media::{self, Command, MediaInfo};
 use crate::monitors::Mon;
@@ -13,21 +15,318 @@ use crate::notifications::Toast;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::*;
+use windows::Win32::System::SystemInformation::{GetLocalTime, GlobalMemoryStatusEx, MEMORYSTATUSEX};
+use windows::Win32::System::Threading::GetSystemTimes;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const TIMER_ANIM: usize = 1;
 const TIMER_CLOSE: usize = 2;
-const TIMER_PROGRESS: usize = 3;
+const TIMER_TICK: usize = 3;
 const TIMER_NOTIF: usize = 4;
 const FRAME_MS: u32 = 16;
-const PROGRESS_MS: u32 = 250;
+
+const TIMER_COLOR: u32 = 0xFFFF9F0A;
+const DIM: u32 = 0xFF9E9EA8;
 
 type Rect = (f32, f32, f32, f32);
 
-/// State satu notch (satu per monitor).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Tab {
+    Media,
+    Calendar,
+    Timer,
+    System,
+}
+
+impl Tab {
+    fn parse(s: &str) -> Option<Tab> {
+        match s.trim().to_lowercase().as_str() {
+            "media" | "music" => Some(Tab::Media),
+            "calendar" | "kalender" => Some(Tab::Calendar),
+            "timer" | "stopwatch" => Some(Tab::Timer),
+            "system" | "sistem" => Some(Tab::System),
+            _ => None,
+        }
+    }
+    fn icon(self) -> Icon {
+        match self {
+            Tab::Media => Icon::Music,
+            Tab::Calendar => Icon::Calendar,
+            Tab::Timer => Icon::Stopwatch,
+            Tab::System => Icon::Chart,
+        }
+    }
+}
+
+/// Tab aktif dari config (urutan dipertahankan, duplikat & nama tak dikenal dibuang).
+fn tabs() -> Vec<Tab> {
+    let mut v: Vec<Tab> = Vec::new();
+    for t in config::current().notch.tabs.iter().filter_map(|s| Tab::parse(s)) {
+        if !v.contains(&t) {
+            v.push(t);
+        }
+    }
+    if v.is_empty() {
+        v.push(Tab::Media);
+    }
+    v
+}
+
+/// Item yang bisa tampil di notch ringkas (kiri/kanan badan notch).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Slot {
+    Artwork,
+    Visualizer,
+    Title,
+    Timer,
+    Battery,
+    Clock,
+    Date,
+    Cpu,
+}
+
+impl Slot {
+    fn parse(s: &str) -> Option<Slot> {
+        match s.trim().to_lowercase().as_str() {
+            "artwork" | "art" | "cover" => Some(Slot::Artwork),
+            "visualizer" | "waveform" => Some(Slot::Visualizer),
+            "title" | "song" => Some(Slot::Title),
+            "timer" | "stopwatch" => Some(Slot::Timer),
+            "battery" => Some(Slot::Battery),
+            "clock" | "time" => Some(Slot::Clock),
+            "date" => Some(Slot::Date),
+            "cpu" => Some(Slot::Cpu),
+            _ => None,
+        }
+    }
+}
+
+/// (kiri, kanan) dari config; item pertama = paling luar. Item yang muncul di dua sisi hanya dipakai sekali.
+fn slots() -> (Vec<Slot>, Vec<Slot>) {
+    let n = &config::current().notch;
+    let mut seen: Vec<Slot> = Vec::new();
+    let mut take = |list: &[String]| {
+        let mut out = Vec::new();
+        for sl in list.iter().filter_map(|x| Slot::parse(x)) {
+            if !seen.contains(&sl) {
+                seen.push(sl);
+                out.push(sl);
+            }
+        }
+        out
+    };
+    let left = take(&n.compact_left);
+    let right = take(&n.compact_right);
+    (left, right)
+}
+
+fn has_slot(sl: Slot) -> bool {
+    let (l, r) = slots();
+    l.contains(&sl) || r.contains(&sl)
+}
+
+fn pill() -> bool {
+    config::current().notch.style.eq_ignore_ascii_case("pill")
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Hit {
+    Tab(Tab),
+    Settings,
+    Prev,
+    Play,
+    Next,
+    Seek,
+    WeekPrev,
+    WeekNext,
+    WeekToday,
+    ClockToggle,
+    ClockReset,
+    Mode(bool),
+    Preset(u32),
+}
+
+// ---------- Timer / stopwatch (dibagi semua notch) ----------
+
+#[derive(Default)]
+struct Clock {
+    stopwatch: bool,
+    since: Option<Instant>,
+    acc: Duration,
+    target: Duration,
+    alarm_until: Option<Instant>,
+}
+
+impl Clock {
+    fn running(&self) -> bool {
+        self.since.is_some()
+    }
+    fn elapsed(&self) -> Duration {
+        self.acc + self.since.map(|s| s.elapsed()).unwrap_or_default()
+    }
+    fn remaining(&self) -> Duration {
+        self.target.saturating_sub(self.elapsed())
+    }
+    /// Ada yang layak ditampilkan sebagai live activity.
+    fn active(&self) -> bool {
+        self.running() || self.alarm() || self.elapsed() > Duration::ZERO
+    }
+    fn alarm(&self) -> bool {
+        self.alarm_until.map(|t| Instant::now() < t).unwrap_or(false)
+    }
+    fn text(&self, tenths: bool) -> String {
+        let d = if self.stopwatch { self.elapsed() } else if self.running() || self.elapsed() > Duration::ZERO { self.remaining() } else { self.target };
+        // Hitung mundur dibulatkan ke atas agar "0:00" tepat saat habis.
+        let ms = if self.stopwatch { d.as_millis() as u64 } else { (d.as_millis() as u64).div_ceil(1000) * 1000 };
+        let (h, m, s) = (ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60);
+        let base = if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") };
+        if tenths && self.stopwatch && h == 0 {
+            format!("{base}.{}", ms / 100 % 10)
+        } else {
+            base
+        }
+    }
+    fn toggle(&mut self) {
+        self.alarm_until = None;
+        match self.since.take() {
+            Some(s) => self.acc += s.elapsed(),
+            None => {
+                if !self.stopwatch && self.remaining().is_zero() {
+                    self.acc = Duration::ZERO;
+                    if self.target.is_zero() {
+                        self.target = Duration::from_secs(5 * 60);
+                    }
+                }
+                self.since = Some(Instant::now());
+            }
+        }
+    }
+    fn reset(&mut self) {
+        self.since = None;
+        self.acc = Duration::ZERO;
+        self.alarm_until = None;
+    }
+}
+
+thread_local! {
+    static CLOCK: RefCell<Clock> = RefCell::new(Clock { target: Duration::from_secs(5 * 60), ..Default::default() });
+    static CPU: RefCell<Option<(u64, u64)>> = const { RefCell::new(None) };
+    static WINS: RefCell<HashMap<isize, State>> = RefCell::new(HashMap::new());
+}
+
+fn clock<R>(f: impl FnOnce(&mut Clock) -> R) -> R {
+    CLOCK.with(|c| f(&mut c.borrow_mut()))
+}
+
+/// Periksa hitung mundur; true bila baru saja habis (bunyikan sekali).
+fn check_alarm() -> bool {
+    clock(|c| {
+        if !c.stopwatch && c.running() && c.remaining().is_zero() {
+            c.since = None;
+            c.acc = c.target;
+            c.alarm_until = Some(Instant::now() + Duration::from_secs(8));
+            true
+        } else {
+            false
+        }
+    })
+}
+
+// ---------- Statistik sistem ----------
+
+#[derive(Clone, Copy, Default)]
+struct Sys {
+    cpu: f32,
+    ram: f32,
+    ram_used_gb: f32,
+    ram_total_gb: f32,
+    battery: Option<(u8, bool)>,
+}
+
+fn ft(f: FILETIME) -> u64 {
+    ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64
+}
+
+fn sample_sys(prev: Sys) -> Sys {
+    let mut out = Sys { battery: crate::bar::battery(), ..prev };
+    unsafe {
+        let (mut i, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default());
+        if GetSystemTimes(Some(&mut i), Some(&mut k), Some(&mut u)).is_ok() {
+            let (idle, total) = (ft(i), ft(k) + ft(u));
+            if let Some((pi, pt)) = CPU.with(|c| c.replace(Some((idle, total)))) {
+                let (di, dt) = (idle.saturating_sub(pi), total.saturating_sub(pt));
+                if dt > 0 {
+                    out.cpu = (1.0 - di as f32 / dt as f32).clamp(0.0, 1.0);
+                }
+            }
+        }
+        let mut m = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+        if GlobalMemoryStatusEx(&mut m).is_ok() {
+            let gb = 1024.0 * 1024.0 * 1024.0;
+            out.ram_total_gb = m.ullTotalPhys as f32 / gb;
+            out.ram_used_gb = (m.ullTotalPhys - m.ullAvailPhys) as f32 / gb;
+            out.ram = out.ram_used_gb / out.ram_total_gb.max(0.01);
+        }
+    }
+    out
+}
+
+// ---------- Tanggal ----------
+
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 }, m, d)
+}
+
+/// 0 = Senin ... 6 = Minggu.
+fn weekday(days: i64) -> usize {
+    (days + 3).rem_euclid(7) as usize
+}
+
+struct Names {
+    days_short: [&'static str; 7],
+    days_long: [&'static str; 7],
+    months: [&'static str; 12],
+}
+
+fn names() -> Names {
+    if config::current().general.language == "en" {
+        Names {
+            days_short: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+            days_long: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+            months: ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"],
+        }
+    } else {
+        Names {
+            days_short: ["Sen", "Sel", "Rab", "Kam", "Jum", "Sab", "Min"],
+            days_long: ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"],
+            months: ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember"],
+        }
+    }
+}
+
+// ---------- State per notch ----------
+
 struct State {
     mon: Mon,
     target_open: bool,
@@ -37,6 +336,7 @@ struct State {
     last: Instant,
     tracking: bool,
     art: Option<(usize, Image)>,
+    tint: Option<u32>,
     /// Spring kartu notifikasi (0 = tidak ada, 1 = kartu penuh) dan statusnya.
     nt: f32,
     nv: f32,
@@ -45,10 +345,15 @@ struct State {
     notif_img: Option<Image>,
     queue: VecDeque<Toast>,
     hover: bool,
-}
-
-thread_local! {
-    static WINS: RefCell<HashMap<isize, State>> = RefCell::new(HashMap::new());
+    tab: Tab,
+    week_off: i64,
+    rects: Vec<(Rect, Hit)>,
+    hover_hit: Option<Hit>,
+    seek_bar: Rect,
+    sys: Sys,
+    sys_at: Option<Instant>,
+    tick_ms: u32,
+    born: Instant,
 }
 
 fn with<R>(hwnd: HWND, f: impl FnOnce(&mut State) -> R) -> Option<R> {
@@ -56,6 +361,7 @@ fn with<R>(hwnd: HWND, f: impl FnOnce(&mut State) -> R) -> Option<R> {
 }
 
 pub fn attach(hwnd: HWND, mon: Mon) {
+    let tab = Tab::parse(&config::current().notch.default_tab).filter(|t| tabs().contains(t)).unwrap_or(tabs()[0]);
     WINS.with(|w| {
         w.borrow_mut().insert(
             hwnd.0 as isize,
@@ -67,6 +373,7 @@ pub fn attach(hwnd: HWND, mon: Mon) {
                 last: Instant::now(),
                 tracking: false,
                 art: None,
+                tint: None,
                 nt: 0.0,
                 nv: 0.0,
                 n_target: false,
@@ -74,6 +381,15 @@ pub fn attach(hwnd: HWND, mon: Mon) {
                 notif_img: None,
                 queue: VecDeque::new(),
                 hover: false,
+                tab,
+                week_off: 0,
+                rects: Vec::new(),
+                hover_hit: None,
+                seek_bar: (0.0, 0.0, 0.0, 0.0),
+                sys: Sys::default(),
+                sys_at: None,
+                tick_ms: 0,
+                born: Instant::now(),
             },
         );
     });
@@ -87,47 +403,6 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
-struct Layout {
-    art: Rect,
-    title: Rect,
-    artist: Rect,
-    lyric1: Rect,
-    lyric2: Rect,
-    time_l: Rect,
-    time_r: Rect,
-    bar: Rect,
-    prev: (f32, f32),
-    play: (f32, f32),
-    next: (f32, f32),
-}
-
-/// Tata letak isi saat terbuka. Koordinat dalam jendela; badan notch mulai di x = ear.
-fn layout(body_w: f32, ear: f32, ch: f32, s: f32) -> Layout {
-    let bx = ear;
-    let pad = 22.0 * s;
-    let y0 = ch + 6.0 * s;
-    let iw = body_w - 2.0 * pad;
-    let art_s = 64.0 * s;
-    let tx = bx + pad + art_s + 14.0 * s;
-    let tw = bx + body_w - pad - tx;
-    let ty = y0 + 130.0 * s;
-    let cy = y0 + 160.0 * s;
-    let cx = bx + body_w / 2.0;
-    Layout {
-        art: (bx + pad, y0, art_s, art_s),
-        title: (tx, y0 + 6.0 * s, tw, 22.0 * s),
-        artist: (tx, y0 + 30.0 * s, tw, 18.0 * s),
-        lyric1: (bx + pad, y0 + 78.0 * s, iw, 24.0 * s),
-        lyric2: (bx + pad, y0 + 102.0 * s, iw, 18.0 * s),
-        time_l: (bx + pad, ty - 8.0 * s, 40.0 * s, 16.0 * s),
-        time_r: (bx + body_w - pad - 40.0 * s, ty - 8.0 * s, 40.0 * s, 16.0 * s),
-        bar: (bx + pad + 46.0 * s, ty - 2.0 * s, iw - 92.0 * s, 4.0 * s),
-        prev: (cx - 72.0 * s, cy),
-        play: (cx, cy),
-        next: (cx + 72.0 * s, cy),
-    }
-}
-
 fn fmt_time(ms: u64) -> String {
     let s = ms / 1000;
     format!("{}:{:02}", s / 60, s % 60)
@@ -136,21 +411,64 @@ fn fmt_time(ms: u64) -> String {
 /// Dimensi akhir (badan ringkas, badan terbuka, tinggi ringkas, tinggi terbuka) dalam piksel.
 fn dims(s: f32) -> (f32, f32, f32, f32) {
     let n = &config::current().notch;
-    (n.compact_width as f32 * s, n.expanded_width as f32 * s, n.compact_height as f32 * s, n.expanded_height as f32 * s)
+    let ch = n.compact_height.clamp(18, 48) as f32 * s;
+    let eh = (n.expanded_height as f32 * s).max(ch + 96.0 * s);
+    (n.compact_width as f32 * s, n.expanded_width.max(360) as f32 * s, ch, eh)
 }
 
 fn is_settled_open(hwnd: HWND) -> bool {
     with(hwnd, |st| st.target_open && (st.x - 1.0).abs() < 0.01 && st.v.abs() < 0.05).unwrap_or(false)
 }
 
-/// Timer progres/lirik hanya saat terbuka penuh dan musik diputar.
-fn sync_progress_timer(hwnd: HWND) {
-    let want = is_settled_open(hwnd) && media::info().playing;
+/// Pilih interval gambar ulang sesuai apa yang sedang bergerak; 0 = mati.
+fn sync_tick(hwnd: HWND) {
+    let info = media::info();
+    let Some((open, tab, anim, cur)) = with(hwnd, |st| (st.target_open && st.x > 0.9, st.tab, st.v.abs() > 0.0 || st.nt > 0.0, st.tick_ms)) else { return };
+    let (running, alarm, active) = clock(|c| (c.running(), c.alarm(), c.active()));
+    let mut want = u32::MAX;
+    let mut need = |ms: u32| want = want.min(ms);
+    if alarm {
+        need(60);
+    }
+    if open {
+        match tab {
+            Tab::Media if info.playing => need(250),
+            Tab::Timer if running => need(100),
+            Tab::System => need(1000),
+            Tab::Calendar => need(5000),
+            _ => {}
+        }
+    } else {
+        if info.active && info.playing && has_slot(Slot::Visualizer) {
+            need(70);
+        }
+        if has_slot(Slot::Timer) {
+            if running {
+                need(250);
+            } else if active {
+                need(1000);
+            }
+        }
+        if has_slot(Slot::Cpu) {
+            need(2000);
+        }
+        if has_slot(Slot::Clock) || has_slot(Slot::Date) {
+            need(5000);
+        }
+        if has_slot(Slot::Battery) || info.active && has_slot(Slot::Title) {
+            need(30000);
+        }
+    }
+    let want = if want == u32::MAX || anim && want > 1000 { 0 } else { want };
+    if want == cur {
+        return;
+    }
+    with(hwnd, |st| st.tick_ms = want);
     unsafe {
-        if want {
-            SetTimer(Some(hwnd), TIMER_PROGRESS, PROGRESS_MS, None);
+        if want == 0 {
+            let _ = KillTimer(Some(hwnd), TIMER_TICK);
         } else {
-            let _ = KillTimer(Some(hwnd), TIMER_PROGRESS);
+            SetTimer(Some(hwnd), TIMER_TICK, want, None);
         }
     }
 }
@@ -158,46 +476,375 @@ fn sync_progress_timer(hwnd: HWND) {
 /// Dipanggil saat info media/lirik berubah.
 pub fn on_media(hwnd: HWND) {
     redraw(hwnd);
-    sync_progress_timer(hwnd);
 }
 
-fn draw_lyrics(c: &Canvas, l: &Layout, info: &MediaInfo, fade: f32, s: f32, font: &str) {
-    let big = Font::new(font, 14.5 * s, true);
-    let small = Font::new(font, 12.0 * s, false);
-    let a = |col: u32| config::with_alpha(col, fade * ((col >> 24) as f32 / 255.0));
-    let (mut line1, mut line2) = (String::new(), String::new());
-    match lyrics::get(info.key) {
-        None => {}
-        Some(Lyrics::Loading) => line1 = "Memuat lirik...".into(),
-        Some(Lyrics::NotFound) => line1 = "Lirik tidak ditemukan".into(),
-        Some(Lyrics::Instrumental) => line1 = "Instrumental".into(),
-        Some(Lyrics::Synced(lines)) => {
-            let pos = info.position_ms();
-            match lyrics::current_line(&lines, pos) {
-                Some(i) => {
-                    line1 = if lines[i].1.is_empty() { "\u{266A}".into() } else { lines[i].1.clone() };
-                    line2 = lines.get(i + 1).map(|(_, t)| t.clone()).unwrap_or_default();
-                }
-                None => {
-                    line1 = "\u{266A}".into();
-                    line2 = lines.first().map(|(_, t)| t.clone()).unwrap_or_default();
-                }
-            }
+// ---------- Gambar ----------
+
+struct Ctx<'a> {
+    c: &'a Canvas,
+    s: f32,
+    font: String,
+    fade: f32,
+    tint: u32,
+    bg: u32,
+    hover: Option<Hit>,
+    rects: Vec<(Rect, Hit)>,
+}
+
+impl Ctx<'_> {
+    fn a(&self, col: u32) -> u32 {
+        config::with_alpha(col, self.fade * ((col >> 24) as f32 / 255.0))
+    }
+    fn text(&self, t: &str, r: Rect, size: f32, bold: bool, col: u32, al: Align) {
+        self.c.text(t, &Font::new(&self.font, size * self.s, bold), r, self.a(col), al);
+    }
+    /// Ikon filled berukuran `size` DIP di tengah kotak `r`.
+    fn icon(&self, ic: Icon, r: Rect, size: f32, col: u32) {
+        let k = size * self.s;
+        icons::draw(self.c, ic, (r.0 + (r.2 - k) / 2.0, r.1 + (r.3 - k) / 2.0, k, k), self.a(col), self.bg);
+    }
+    fn round(&self, r: Rect, rad: f32, col: u32) {
+        let k = rad * self.s;
+        self.c.fill_round_rect(r.0, r.1, r.2, r.3, (k, k, k, k), self.a(col));
+    }
+    fn hit(&mut self, r: Rect, h: Hit) {
+        self.rects.push((r, h));
+    }
+    fn hovered(&self, h: Hit) -> bool {
+        self.hover == Some(h)
+    }
+    /// Tombol bulat dengan glyph; latar muncul saat hover.
+    fn button(&mut self, cx: f32, cy: f32, d: f32, ic: Icon, size: f32, col: u32, h: Hit) {
+        let r = (cx - d / 2.0, cy - d / 2.0, d, d);
+        if self.hovered(h) {
+            self.c.fill_ellipse(r.0, r.1, r.2, r.3, self.a(0x26FFFFFF));
         }
-        Some(Lyrics::Plain(lines)) => {
-            // Tanpa stempel waktu: perkiraan baris dari persentase lagu.
-            let n = lines.iter().filter(|x| !x.is_empty()).count().max(1);
+        self.icon(ic, r, size, col);
+        self.hit(r, h);
+    }
+}
+
+fn lyric_line(info: &MediaInfo) -> Option<String> {
+    if !lyrics::ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    match lyrics::get(info.key)? {
+        Lyrics::Synced(lines) => {
+            let i = lyrics::current_line(&lines, info.position_ms())?;
+            Some(if lines[i].1.is_empty() { "\u{266A}".into() } else { lines[i].1.clone() })
+        }
+        Lyrics::Plain(lines) => {
             let nonempty: Vec<&String> = lines.iter().filter(|x| !x.is_empty()).collect();
             let frac = if info.duration_ms > 0 { info.position_ms() as f32 / info.duration_ms as f32 } else { 0.0 };
-            let i = ((frac * n as f32) as usize).min(n - 1);
-            line1 = nonempty.get(i).map(|s| s.to_string()).unwrap_or_default();
-            line2 = nonempty.get(i + 1).map(|s| s.to_string()).unwrap_or_default();
+            let i = ((frac * nonempty.len() as f32) as usize).min(nonempty.len().saturating_sub(1));
+            nonempty.get(i).map(|s| s.to_string())
+        }
+        Lyrics::Instrumental => Some("Instrumental".into()),
+        _ => None,
+    }
+}
+
+/// Tinggi isi tiap tab (sebelum dipusatkan vertikal).
+const CONTENT_H: f32 = 74.0;
+
+fn draw_media(x: &mut Ctx, art: Option<&Image>, info: &MediaInfo, bx: f32, bw: f32, y0: f32) -> Rect {
+    let s = x.s;
+    let pad = 20.0 * s;
+    let art_s = 74.0 * s;
+    let (ax, ay) = (bx + pad, y0);
+    match art {
+        Some(img) => x.c.draw_image(img, ax, ay, art_s, art_s, 14.0 * s, x.fade),
+        None => {
+            x.round((ax, ay, art_s, art_s), 14.0, 0xFF26262B);
+            x.icon(Icon::Music, (ax, ay, art_s, art_s), 30.0, if info.active { x.tint } else { 0xFF55555F });
         }
     }
-    let dim = matches!(lyrics::get(info.key), None | Some(Lyrics::Loading | Lyrics::NotFound | Lyrics::Instrumental));
-    let c1 = if dim { 0xFF8E8E98 } else { 0xFFFFFFFF };
-    c.text(&line1, &big, l.lyric1, a(c1), Align::Center);
-    c.text(&line2, &small, l.lyric2, a(0xFF7A7A85), Align::Center);
+    let rx = bx + bw - pad;
+    let tx = ax + art_s + 16.0 * s;
+    // Kontrol di kanan atas, sejajar judul.
+    let (cy, gap, d) = (y0 + 20.0 * s, 34.0 * s, 32.0 * s);
+    let ctrl = if info.active { 0xFFFFFFFF } else { 0xFF55555F };
+    let play_icon = if info.playing { Icon::Pause } else { Icon::Play };
+    x.button(rx - 2.0 * gap - d / 2.0 + 6.0 * s, cy, d, Icon::Prev, 16.0, ctrl, Hit::Prev);
+    x.button(rx - gap - d / 2.0 + 6.0 * s, cy, d + 4.0 * s, play_icon, 21.0, ctrl, Hit::Play);
+    x.button(rx - d / 2.0 + 6.0 * s, cy, d, Icon::Next, 16.0, ctrl, Hit::Next);
+    let text_w = (rx - 3.0 * gap - 8.0 * s - tx).max(40.0 * s);
+
+    let (title, artist) = if info.active {
+        (if info.title.is_empty() { "Tanpa judul".to_string() } else { info.title.clone() }, info.artist.clone())
+    } else {
+        ("Tidak ada media".to_string(), "Putar musik untuk mengontrolnya di sini".to_string())
+    };
+    x.text(&title, (tx, y0 + 2.0 * s, text_w, 21.0 * s), 15.0, true, 0xFFFFFFFF, Align::Near);
+    x.text(&artist, (tx, y0 + 23.0 * s, text_w, 17.0 * s), 12.5, false, DIM, Align::Near);
+    if let Some(line) = info.active.then(|| lyric_line(info)).flatten() {
+        x.text(&line, (tx, y0 + 42.0 * s, rx - tx, 17.0 * s), 12.5, false, 0xD0FFFFFF, Align::Near);
+    }
+
+    // Progres (klik untuk lompat).
+    let mut bar = (0.0, 0.0, 0.0, 0.0);
+    if info.active {
+        let pos = info.position_ms();
+        let ty = y0 + art_s - 7.0 * s;
+        let tw = 34.0 * s;
+        bar = (tx + tw + 6.0 * s, ty - 2.0 * s, rx - tx - 2.0 * tw - 12.0 * s, 4.0 * s);
+        let (bx2, by, bw2, bh) = bar;
+        x.round(bar, 2.0, 0x38FFFFFF);
+        let frac = if info.duration_ms > 0 { (pos as f32 / info.duration_ms as f32).clamp(0.0, 1.0) } else { 0.0 };
+        if frac > 0.0 {
+            x.round((bx2, by, (bw2 * frac).max(bh), bh), 2.0, x.tint);
+        }
+        x.text(&fmt_time(pos), (tx, ty - 8.0 * s, tw, 16.0 * s), 10.5, false, DIM, Align::Near);
+        let right = if info.duration_ms > 0 { format!("-{}", fmt_time(info.duration_ms.saturating_sub(pos))) } else { "LIVE".into() };
+        x.text(&right, (rx - tw, ty - 8.0 * s, tw, 16.0 * s), 10.5, false, DIM, Align::Far);
+        x.hit((bx2 - 4.0 * s, by - 8.0 * s, bw2 + 8.0 * s, bh + 16.0 * s), Hit::Seek);
+    }
+    bar
+}
+
+fn draw_calendar(x: &mut Ctx, bx: f32, bw: f32, y0: f32, week_off: i64) {
+    let s = x.s;
+    let pad = 20.0 * s;
+    let n = names();
+    let now = unsafe { GetLocalTime() };
+    let today = days_from_civil(now.wYear as i64, now.wMonth as u32, now.wDay as u32);
+    let wd = weekday(today);
+
+    // Kiri: tanggal besar.
+    let lx = bx + pad;
+    x.text(n.days_long[wd], (lx, y0, 120.0 * s, 16.0 * s), 12.5, true, x.tint, Align::Near);
+    x.text(&now.wDay.to_string(), (lx - 2.0 * s, y0 + 14.0 * s, 120.0 * s, 42.0 * s), 34.0, true, 0xFFFFFFFF, Align::Near);
+    let my = format!("{} {}", n.months[now.wMonth as usize - 1], now.wYear);
+    x.text(&my, (lx, y0 + 56.0 * s, 130.0 * s, 16.0 * s), 11.5, false, DIM, Align::Near);
+
+    // Kanan: strip satu minggu (Senin–Minggu) dengan navigasi.
+    let gx = lx + 150.0 * s;
+    let gw = bx + bw - pad - gx;
+    let monday = today - wd as i64 + week_off * 7;
+    let col = gw / 7.0;
+    for i in 0..7 {
+        let day = monday + i as i64;
+        let (_, m, d) = civil_from_days(day);
+        let cx = gx + col * i as f32;
+        let weekend = i >= 5;
+        x.text(n.days_short[i], (cx, y0 + 2.0 * s, col, 14.0 * s), 10.5, false, if weekend { 0xFF6E6E78 } else { DIM }, Align::Center);
+        let r = (cx + (col - 30.0 * s) / 2.0, y0 + 20.0 * s, 30.0 * s, 30.0 * s);
+        let is_today = day == today;
+        if is_today {
+            x.c.fill_ellipse(r.0, r.1, r.2, r.3, x.a(x.tint));
+        }
+        let colr = if is_today { 0xFFFFFFFF } else if m != now.wMonth as u32 { 0xFF6E6E78 } else { 0xFFE6E6EA };
+        x.text(&d.to_string(), r, 13.5, is_today, colr, Align::Center);
+    }
+    let (_, m0, d0) = civil_from_days(monday);
+    let (_, m1, d1) = civil_from_days(monday + 6);
+    let range = if m0 == m1 { format!("{d0}–{d1} {}", n.months[m1 as usize - 1]) } else { format!("{d0} {} – {d1} {}", &n.months[m0 as usize - 1][..3], &n.months[m1 as usize - 1][..3]) };
+    let ny = y0 + 62.0 * s;
+    x.button(gx + 10.0 * s, ny, 22.0 * s, Icon::ChevronLeft, 11.0, DIM, Hit::WeekPrev);
+    let label_r = (gx + 24.0 * s, ny - 8.0 * s, gw - 48.0 * s, 16.0 * s);
+    let label = if week_off == 0 { range } else { format!("{range}  ·  Hari ini") };
+    x.text(&label, label_r, 11.0, false, if x.hovered(Hit::WeekToday) { 0xFFFFFFFF } else { DIM }, Align::Center);
+    if week_off != 0 {
+        x.hit(label_r, Hit::WeekToday);
+    }
+    x.button(gx + gw - 10.0 * s, ny, 22.0 * s, Icon::ChevronRight, 11.0, DIM, Hit::WeekNext);
+}
+
+fn draw_timer(x: &mut Ctx, bx: f32, bw: f32, y0: f32) {
+    let s = x.s;
+    let pad = 20.0 * s;
+    let (stopwatch, running, alarm, text) = clock(|c| (c.stopwatch, c.running(), c.alarm(), c.text(true)));
+    let color = if stopwatch { 0xFFFFFFFF } else { TIMER_COLOR };
+    let lx = bx + pad;
+    let big = if alarm { "Waktu habis".to_string() } else { text };
+    x.text(&big, (lx, y0 - 2.0 * s, 220.0 * s, 44.0 * s), if alarm { 24.0 } else { 34.0 }, true, color, Align::Near);
+
+    // Pilihan mode.
+    let seg = (lx, y0 + 48.0 * s, 176.0 * s, 26.0 * s);
+    x.round(seg, 8.0, 0xFF26262B);
+    for (j, (label, sw)) in [("Timer", false), ("Stopwatch", true)].into_iter().enumerate() {
+        let r = (seg.0 + 2.0 * s + j as f32 * (seg.2 - 4.0 * s) / 2.0, seg.1 + 2.0 * s, (seg.2 - 4.0 * s) / 2.0, seg.3 - 4.0 * s);
+        if sw == stopwatch {
+            x.round(r, 6.0, 0xFF48484F);
+        } else if x.hovered(Hit::Mode(sw)) {
+            x.round(r, 6.0, 0x1AFFFFFF);
+        }
+        x.text(label, r, 11.5, sw == stopwatch, if sw == stopwatch { 0xFFFFFFFF } else { DIM }, Align::Center);
+        x.hit(r, Hit::Mode(sw));
+    }
+
+    // Kanan: tombol mulai/jeda + reset, lalu preset.
+    let rx = bx + bw - pad;
+    let cy = y0 + 18.0 * s;
+    let d = 38.0 * s;
+    let main = (rx - d, cy - d / 2.0, d, d);
+    x.c.fill_ellipse(main.0, main.1, main.2, main.3, x.a(config::with_alpha(color, if x.hovered(Hit::ClockToggle) { 0.45 } else { 0.30 })));
+    x.icon(if running { Icon::Pause } else { Icon::Play }, main, 17.0, color);
+    x.hit(main, Hit::ClockToggle);
+    let reset = (main.0 - d - 10.0 * s, main.1, d, d);
+    x.c.fill_ellipse(reset.0, reset.1, reset.2, reset.3, x.a(if x.hovered(Hit::ClockReset) { 0xFF4A4A52 } else { 0xFF333339 }));
+    x.icon(Icon::Reset, reset, 17.0, 0xFFFFFFFF);
+    x.hit(reset, Hit::ClockReset);
+
+    if !stopwatch {
+        let presets: [(u32, &str); 4] = [(1, "+1m"), (5, "5m"), (15, "15m"), (25, "25m")];
+        let cw = 44.0 * s;
+        let mut cx = rx - presets.len() as f32 * (cw + 6.0 * s) + 6.0 * s;
+        for (min, label) in presets {
+            let r = (cx, y0 + 48.0 * s, cw, 26.0 * s);
+            x.round(r, 13.0, if x.hovered(Hit::Preset(min)) { 0xFF46464E } else { 0xFF2C2C32 });
+            x.text(label, r, 11.5, false, 0xFFE6E6EA, Align::Center);
+            x.hit(r, Hit::Preset(min));
+            cx += cw + 6.0 * s;
+        }
+    }
+}
+
+fn gauge(x: &Ctx, cx: f32, cy: f32, frac: f32, color: u32, value: &str, label: &str) {
+    let s = x.s;
+    let r = 22.0 * s;
+    x.c.stroke_arc(cx, cy, r, 0.0, 360.0, 5.0 * s, x.a(0x2EFFFFFF));
+    x.c.stroke_arc(cx, cy, r, -90.0, 360.0 * frac.clamp(0.0, 1.0), 5.0 * s, x.a(color));
+    x.text(value, (cx - r, cy - r, 2.0 * r, 2.0 * r), 11.5, true, 0xFFFFFFFF, Align::Center);
+    x.text(label, (cx - 60.0 * s, cy + r + 6.0 * s, 120.0 * s, 15.0 * s), 11.0, false, DIM, Align::Center);
+}
+
+fn draw_system(x: &mut Ctx, sys: &Sys, bx: f32, bw: f32, y0: f32) {
+    let s = x.s;
+    let cy = y0 + 26.0 * s;
+    let mut items: Vec<(f32, u32, String, String)> = Vec::new();
+    if let Some((pct, charging)) = sys.battery {
+        let col = if charging { 0xFF30D158 } else if pct <= 20 { 0xFFFF453A } else { 0xFF30D158 };
+        items.push((pct as f32 / 100.0, col, format!("{pct}%"), if charging { "Mengisi daya".into() } else { "Baterai".into() }));
+    }
+    items.push((sys.cpu, 0xFF0A84FF, format!("{:.0}%", sys.cpu * 100.0), "CPU".into()));
+    items.push((sys.ram, 0xFFBF5AF2, format!("{:.0}%", sys.ram * 100.0), format!("RAM {:.1}/{:.0} GB", sys.ram_used_gb, sys.ram_total_gb)));
+    let col_w = bw / items.len() as f32;
+    for (i, (frac, color, value, label)) in items.iter().enumerate() {
+        gauge(x, bx + col_w * (i as f32 + 0.5), cy, *frac, *color, value, label);
+    }
+}
+
+struct Compact {
+    left: Vec<(Slot, f32)>,
+    right: Vec<(Slot, f32)>,
+}
+
+const SLOT_GAP: f32 = 8.0;
+const SLOT_PAD: f32 = 10.0;
+
+/// Item ringkas yang relevan saat ini beserta lebarnya (piksel).
+fn compact_items(info: &MediaInfo, sys: &Sys, ch: f32, s: f32, font: &str) -> Compact {
+    let Some(m) = Canvas::new(1, 1) else { return Compact { left: Vec::new(), right: Vec::new() } };
+    let f = Font::new(font, 12.0 * s, false);
+    let fb = Font::new(font, 12.5 * s, true);
+    let (timer_on, timer_text) = clock(|k| (k.active(), k.text(false)));
+    let sz = (ch - 10.0 * s).min(20.0 * s);
+    let width = |sl: Slot| -> Option<f32> {
+        match sl {
+            Slot::Artwork => info.active.then_some(sz),
+            Slot::Visualizer => info.active.then_some(16.0 * s),
+            Slot::Title => info.active.then(|| m.measure(&info.title, &f).min(150.0 * s)).filter(|w| *w > 0.0),
+            Slot::Timer => timer_on.then(|| 17.0 * s + m.measure(&timer_text, &fb)),
+            Slot::Battery => sys.battery.map(|(p, _)| 25.0 * s + m.measure(&format!("{p}%"), &f)),
+            Slot::Clock => Some(m.measure(&clock_text(), &fb)),
+            Slot::Date => Some(m.measure(&date_text(), &f)),
+            Slot::Cpu => Some(17.0 * s + m.measure(&format!("{:.0}%", sys.cpu * 100.0), &f)),
+        }
+    };
+    let (l, r) = slots();
+    let pick = |v: Vec<Slot>| v.into_iter().filter_map(|sl| width(sl).map(|w| (sl, w))).collect();
+    Compact { left: pick(l), right: pick(r) }
+}
+
+fn side_width(v: &[(Slot, f32)], s: f32) -> f32 {
+    if v.is_empty() {
+        0.0
+    } else {
+        v.iter().map(|(_, w)| w).sum::<f32>() + SLOT_GAP * s * (v.len() - 1) as f32
+    }
+}
+
+/// Lebar badan ringkas: minimal `compact_width`, melebar bila isinya butuh ruang lebih.
+fn compact_body(cw: f32, items: &Compact, s: f32) -> f32 {
+    let (lw, rw) = (side_width(&items.left, s), side_width(&items.right, s));
+    let center = if lw > 0.0 && rw > 0.0 { 64.0 * s } else { 24.0 * s };
+    cw.max(2.0 * SLOT_PAD * s + lw + rw + center)
+}
+
+fn clock_text() -> String {
+    let t = unsafe { GetLocalTime() };
+    format!("{:02}:{:02}", t.wHour, t.wMinute)
+}
+
+fn date_text() -> String {
+    let t = unsafe { GetLocalTime() };
+    let n = names();
+    let wd = weekday(days_from_civil(t.wYear as i64, t.wMonth as u32, t.wDay as u32));
+    format!("{} {}", n.days_short[wd], t.wDay)
+}
+
+/// Isi saat ringkas: item kiri dari tepi kiri ke dalam, item kanan dari tepi kanan ke dalam.
+#[allow(clippy::too_many_arguments)]
+fn draw_compact(c: &Canvas, items: &Compact, art: Option<&Image>, info: &MediaInfo, sys: &Sys, ear: f32, body_w: f32, ch: f32, s: f32, f: f32, tint: u32, bg: u32, font: &str, t_anim: f32) {
+    let a = |col: u32| config::with_alpha(col, f * ((col >> 24) as f32 / 255.0));
+    let sz = (ch - 10.0 * s).min(20.0 * s);
+    let cy = ch / 2.0;
+    let (stopwatch, alarm, timer_text) = clock(|k| (k.stopwatch, k.alarm(), k.text(false)));
+    let small = Font::new(font, 12.0 * s, false);
+    let bold = Font::new(font, 12.5 * s, true);
+    let draw = |sl: Slot, x: f32, w: f32| match sl {
+        Slot::Artwork => match art {
+            Some(img) => c.draw_image(img, x, (ch - sz) / 2.0, sz, sz, 5.0 * s, f),
+            None => icons::draw(c, Icon::Music, (x, (ch - sz) / 2.0, sz, sz), a(tint), bg),
+        },
+        Slot::Visualizer => {
+            if info.playing {
+                for i in 0..4 {
+                    let speed = [7.1f32, 9.3, 6.2, 8.4][i];
+                    let phase = [0.0f32, 1.3, 2.6, 0.7][i];
+                    let lvl = 0.3 + 0.7 * ((t_anim * speed + phase).sin() * 0.5 + 0.5);
+                    let bh = (sz * 0.85 * lvl).max(3.0 * s);
+                    let k = 1.3 * s;
+                    c.fill_round_rect(x + i as f32 * 4.4 * s, cy - bh / 2.0, 2.6 * s, bh, (k, k, k, k), a(tint));
+                }
+            } else {
+                icons::draw(c, Icon::Pause, (x + 2.0 * s, cy - 6.0 * s, 12.0 * s, 12.0 * s), a(DIM), bg);
+            }
+        }
+        Slot::Title => c.text(&info.title, &small, (x, 0.0, w, ch), a(0xE6FFFFFF), Align::Near),
+        Slot::Timer => {
+            let col = if stopwatch { 0xFFFFFFFF } else { TIMER_COLOR };
+            let pulse = if alarm { 0.55 + 0.45 * (t_anim * 6.0).sin().abs() } else { 1.0 };
+            let col = a(config::with_alpha(col, pulse));
+            icons::draw(c, Icon::Stopwatch, (x, cy - 7.0 * s, 13.0 * s, 13.0 * s), col, bg);
+            c.text(&timer_text, &bold, (x + 17.0 * s, 0.0, w - 17.0 * s + 2.0 * s, ch), col, Align::Near);
+        }
+        Slot::Battery => {
+            if let Some((p, charging)) = sys.battery {
+                let col = if charging { 0xFF30D158 } else if p <= 20 { 0xFFFF453A } else { 0xFFFFFFFF };
+                icons::draw(c, Icon::Battery(p), (x, cy - 10.0 * s, 20.0 * s, 20.0 * s), a(col), bg);
+                c.text(&format!("{p}%"), &small, (x + 25.0 * s, 0.0, w - 25.0 * s + 2.0 * s, ch), a(0xE6FFFFFF), Align::Near);
+            }
+        }
+        Slot::Clock => c.text(&clock_text(), &bold, (x, 0.0, w + 2.0 * s, ch), a(0xFFFFFFFF), Align::Near),
+        Slot::Date => c.text(&date_text(), &small, (x, 0.0, w + 2.0 * s, ch), a(0xE6FFFFFF), Align::Near),
+        Slot::Cpu => {
+            icons::draw(c, Icon::Cpu, (x, cy - 7.0 * s, 13.0 * s, 13.0 * s), a(0xFF0A84FF), bg);
+            c.text(&format!("{:.0}%", sys.cpu * 100.0), &small, (x + 17.0 * s, 0.0, w - 17.0 * s + 2.0 * s, ch), a(0xE6FFFFFF), Align::Near);
+        }
+    };
+    let mut x = ear + SLOT_PAD * s;
+    for (sl, w) in &items.left {
+        draw(*sl, x, *w);
+        x += w + SLOT_GAP * s;
+    }
+    let mut x = ear + body_w - SLOT_PAD * s;
+    for (sl, w) in &items.right {
+        x -= w;
+        draw(*sl, x, *w);
+        x -= SLOT_GAP * s;
+    }
 }
 
 /// Ukuran badan kartu notifikasi (lebar, tinggi total termasuk strip bar di atasnya).
@@ -282,7 +929,7 @@ fn advance_notif(hwnd: HWND) -> bool {
     })
     .unwrap_or(false);
     if started {
-        start_anim(hwnd, false); // panel media menutup dulu
+        start_anim(hwnd, false); // panel menutup dulu
         let dur = config::current().notifications.duration_ms.max(1000);
         unsafe {
             SetTimer(Some(hwnd), TIMER_ANIM, FRAME_MS, None);
@@ -311,19 +958,42 @@ pub fn redraw(hwnd: HWND) {
     let cfg = config::current();
     let info = media::info();
 
-    // Sampul: decode ulang hanya saat gambar berganti.
+    // Sampul: decode ulang (dan hitung warnanya) hanya saat gambar berganti.
     let want = info.thumb.as_ref().map(|t| Arc::as_ptr(t) as usize);
-    let Some(mut art) = with(hwnd, |st| st.art.take()) else { return };
+    let Some((mut art, mut tint)) = with(hwnd, |st| (st.art.take(), st.tint)) else { return };
     match (want, &art) {
         (Some(p), Some((q, _))) if p == *q => {}
-        (Some(p), _) => art = info.thumb.as_ref().and_then(|t| Image::from_bytes(t)).map(|i| (p, i)),
-        (None, _) => art = None,
+        (Some(p), _) => {
+            art = info.thumb.as_ref().and_then(|t| Image::from_bytes(t)).map(|i| (p, i));
+            tint = art.as_ref().and_then(|(_, i)| i.tint());
+        }
+        (None, _) => {
+            art = None;
+            tint = None;
+        }
     }
 
-    let Some((x, nt, mon)) = with(hwnd, |st| (st.x, st.nt, st.mon)) else { return };
+    // Statistik sistem: sampel paling sering sekali per detik, hanya saat tab Sistem terlihat.
+    let compact_sys = has_slot(Slot::Cpu) || has_slot(Slot::Battery);
+    let sys_due = with(hwnd, |st| {
+        let visible = (st.tab == Tab::System && st.x > 0.5) || (compact_sys && st.x < 0.5);
+        visible && st.sys_at.map(|t| t.elapsed() >= Duration::from_millis(900)).unwrap_or(true)
+    })
+    .unwrap_or(false);
+    if sys_due {
+        with(hwnd, |st| {
+            st.sys = sample_sys(st.sys);
+            st.sys_at = Some(Instant::now());
+        });
+    }
+
+    let Some((x, nt, mon, tab, week_off, hover, sys, born)) = with(hwnd, |st| (st.x, st.nt, st.mon, st.tab, st.week_off, st.hover_hit, st.sys, st.born)) else { return };
     let s = mon.scale;
+    let pill = pill();
     let (cw, ew, ch, eh) = dims(s);
-    let ear = 8.0 * s;
+    let items = compact_items(&info, &sys, ch, s, &cfg.bar.font);
+    let cw = compact_body(cw, &items, s);
+    let ear = if pill { 0.0 } else { 8.0 * s };
     let xc = x.clamp(0.0, 1.15);
     let (nw, nh) = notif_dims(s, ch);
     let nc = nt.clamp(0.0, 1.1);
@@ -334,103 +1004,72 @@ pub fn redraw(hwnd: HWND) {
 
     let bg = config::color(&cfg.notch.background);
     let accent = config::color(&cfg.notch.accent);
+    let tint_col = if cfg.notch.tint_from_artwork { tint.unwrap_or(accent) } else { accent };
+    let mut rects = Vec::new();
+    let mut seek_bar = (0.0, 0.0, 0.0, 0.0);
+    let t_anim = born.elapsed().as_secs_f32();
 
     if let Some(c) = Canvas::new(w as i32, h as i32) {
-        c.fill_notch(w, h, ear, lerp(lerp(10.0 * s, 28.0 * s, t), 22.0 * s, nt.clamp(0.0, 1.0)), bg);
+        if pill {
+            let r = lerp(ch / 2.0, 24.0 * s, t).min(h / 2.0);
+            c.fill_round_rect(0.0, 0.0, w, h, (r, r, r, r), bg);
+        } else {
+            c.fill_notch(w, h, ear, lerp(lerp(10.0 * s, 26.0 * s, t), 22.0 * s, nt.clamp(0.0, 1.0)), bg);
+        }
 
         if nt > 0.5 {
             draw_notif(hwnd, &c, body_w, ear, ch, s, ((nt - 0.5) / 0.4).clamp(0.0, 1.0), &cfg.bar.font, accent);
         }
 
         if t < 0.45 && nt < 0.25 {
-            // Ringkas: sampul kecil di kiri, indikator di kanan (hanya bila ada media).
             let f = (1.0 - t / 0.45).clamp(0.0, 1.0);
-            if info.active {
-                let sz = 20.0 * s;
-                let (ax, ay) = (ear + 9.0 * s, (ch - sz) / 2.0);
-                match &art {
-                    Some((_, img)) => c.draw_image(img, ax, ay, sz, sz, 5.0 * s, f),
-                    None => c.fill_round_rect(ax, ay, sz, sz, (5.0 * s, 5.0 * s, 5.0 * s, 5.0 * s), config::with_alpha(accent, f)),
-                }
-                let by = ch / 2.0;
-                let rx = ear + body_w - 12.0 * s;
-                if info.playing {
-                    for (i, bh) in [8.0f32, 15.0, 11.0, 6.0].iter().enumerate() {
-                        let bh = bh * s;
-                        c.fill_round_rect(rx - 16.0 * s + i as f32 * 4.5 * s, by - bh / 2.0, 2.5 * s, bh, (1.2 * s, 1.2 * s, 1.2 * s, 1.2 * s), config::with_alpha(accent, f));
-                    }
-                } else {
-                    let col = config::with_alpha(0xFF9E9EA8, f);
-                    c.fill_round_rect(rx - 10.0 * s, by - 5.0 * s, 3.0 * s, 10.0 * s, (1.0 * s, 1.0 * s, 1.0 * s, 1.0 * s), col);
-                    c.fill_round_rect(rx - 4.0 * s, by - 5.0 * s, 3.0 * s, 10.0 * s, (1.0 * s, 1.0 * s, 1.0 * s, 1.0 * s), col);
-                }
-            }
+            draw_compact(&c, &items, art.as_ref().map(|(_, i)| i), &info, &sys, ear, body_w, ch, s, f, tint_col, bg, &cfg.bar.font, t_anim);
         }
 
         if t > 0.55 && nt < 0.25 {
             let fade = ((t - 0.55) / 0.35).clamp(0.0, 1.0);
-            let a = |col: u32| config::with_alpha(col, fade * ((col >> 24) as f32 / 255.0));
-            let l = layout(body_w, ear, ch, s);
-            let title_f = Font::new(&cfg.bar.font, 15.0 * s, true);
-            let sub_f = Font::new(&cfg.bar.font, 12.5 * s, false);
-            let time_f = Font::new(&cfg.bar.font, 10.5 * s, false);
+            let mut cx = Ctx { c: &c, s, font: cfg.bar.font.clone(), fade, tint: tint_col, bg, hover, rects: Vec::new() };
 
-            match &art {
-                Some((_, img)) => c.draw_image(img, l.art.0, l.art.1, l.art.2, l.art.3, 11.0 * s, fade),
-                None => {
-                    c.fill_round_rect(l.art.0, l.art.1, l.art.2, l.art.3, (11.0 * s, 11.0 * s, 11.0 * s, 11.0 * s), a(0xFF26262B));
-                    let (cx, cy) = (l.art.0 + l.art.2 / 2.0, l.art.1 + l.art.3 / 2.0);
-                    c.fill_polygon(&[(cx - 7.0 * s, cy - 10.0 * s), (cx - 7.0 * s, cy + 10.0 * s), (cx + 10.0 * s, cy)], a(config::with_alpha(accent, 0.9)));
+            // Strip atas: ikon tab di kiri, Pengaturan di kanan.
+            let tabs = tabs();
+            let strip_c = ch / 2.0 + if pill { 2.0 * s } else { 0.0 };
+            if tabs.len() > 1 {
+                for (i, tb) in tabs.iter().enumerate() {
+                    let d = (ch - 6.0 * s).min(26.0 * s);
+                    let r = (ear + 14.0 * s + i as f32 * (d + 4.0 * s), strip_c - d / 2.0, d, d);
+                    if *tb == tab {
+                        c.fill_ellipse(r.0, r.1, r.2, r.3, cx.a(0x30FFFFFF));
+                    } else if cx.hovered(Hit::Tab(*tb)) {
+                        c.fill_ellipse(r.0, r.1, r.2, r.3, cx.a(0x18FFFFFF));
+                    }
+                    cx.icon(tb.icon(), r, 13.0, if *tb == tab { 0xFFFFFFFF } else { DIM });
+                    cx.hit(r, Hit::Tab(*tb));
                 }
             }
+            let d = (ch - 6.0 * s).min(26.0 * s);
+            cx.button(ear + body_w - 14.0 * s - d / 2.0, strip_c, d, Icon::Gear, 14.0, DIM, Hit::Settings);
 
-            let (title, artist) = if info.active {
-                (if info.title.is_empty() { "Tanpa judul".to_string() } else { info.title.clone() }, info.artist.clone())
-            } else {
-                ("Tidak ada media".to_string(), "Putar musik atau video untuk mengontrolnya di sini".to_string())
-            };
-            c.text(&title, &title_f, l.title, a(0xFFFFFFFF), Align::Near);
-            c.text(&artist, &sub_f, l.artist, a(0xFF9E9EA8), Align::Near);
-
-            if info.active {
-                draw_lyrics(&c, &l, &info, fade, s, &cfg.bar.font);
-
-                // Progres.
-                let pos = info.position_ms();
-                let (bx, by, bw, bh) = l.bar;
-                c.fill_round_rect(bx, by, bw, bh, (bh / 2.0, bh / 2.0, bh / 2.0, bh / 2.0), a(0x40FFFFFF));
-                let frac = if info.duration_ms > 0 { pos as f32 / info.duration_ms as f32 } else { 0.0 };
-                if frac > 0.0 {
-                    let fw = (bw * frac).max(bh);
-                    c.fill_round_rect(bx, by, fw, bh, (bh / 2.0, bh / 2.0, bh / 2.0, bh / 2.0), a(0xFFFFFFFF));
-                }
-                c.text(&fmt_time(pos), &time_f, l.time_l, a(0xFF9E9EA8), Align::Near);
-                let right = if info.duration_ms > 0 { format!("-{}", fmt_time(info.duration_ms.saturating_sub(pos))) } else { "LIVE".into() };
-                c.text(&right, &time_f, l.time_r, a(0xFF9E9EA8), Align::Far);
+            let y0 = ch + ((h - ch) - CONTENT_H * s) / 2.0 - 2.0 * s;
+            let y0 = y0.max(ch + 4.0 * s);
+            match tab {
+                Tab::Media => seek_bar = draw_media(&mut cx, art.as_ref().map(|(_, i)| i), &info, ear, body_w, y0),
+                Tab::Calendar => draw_calendar(&mut cx, ear, body_w, y0, week_off),
+                Tab::Timer => draw_timer(&mut cx, ear, body_w, y0),
+                Tab::System => draw_system(&mut cx, &sys, ear, body_w, y0),
             }
-
-            // Kontrol transport.
-            let ctrl = if info.active { 0xFFFFFFFF } else { 0xFF55555F };
-            let u = 9.0 * s;
-            let (px, py) = l.prev;
-            c.fill_round_rect(px - u - 1.0 * s, py - u, 2.5 * s, 2.0 * u, (1.0 * s, 1.0 * s, 1.0 * s, 1.0 * s), a(ctrl));
-            c.fill_polygon(&[(px + u, py - u), (px + u, py + u), (px - u + 3.0 * s, py)], a(ctrl));
-            let (nx, ny) = l.next;
-            c.fill_round_rect(nx + u - 1.5 * s, ny - u, 2.5 * s, 2.0 * u, (1.0 * s, 1.0 * s, 1.0 * s, 1.0 * s), a(ctrl));
-            c.fill_polygon(&[(nx - u, ny - u), (nx - u, ny + u), (nx + u - 3.0 * s, ny)], a(ctrl));
-            let (qx, qy) = l.play;
-            let pu = 13.0 * s;
-            if info.playing {
-                c.fill_round_rect(qx - pu * 0.72, qy - pu, pu * 0.55, 2.0 * pu, (2.0 * s, 2.0 * s, 2.0 * s, 2.0 * s), a(ctrl));
-                c.fill_round_rect(qx + pu * 0.17, qy - pu, pu * 0.55, 2.0 * pu, (2.0 * s, 2.0 * s, 2.0 * s, 2.0 * s), a(ctrl));
-            } else {
-                c.fill_polygon(&[(qx - pu * 0.72, qy - pu), (qx - pu * 0.72, qy + pu), (qx + pu, qy)], a(ctrl));
-            }
+            rects = cx.rects;
         }
 
-        c.present(hwnd, Some((mon.x + ((mon.w as f32 - w) / 2.0).round() as i32, mon.y)));
+        let y = mon.y + if pill { (4.0 * s).round() as i32 } else { 0 };
+        c.present(hwnd, Some((mon.x + ((mon.w as f32 - w) / 2.0).round() as i32, y)));
     }
-    with(hwnd, |st| st.art = art);
+    with(hwnd, |st| {
+        st.art = art;
+        st.tint = tint;
+        st.rects = rects;
+        st.seek_bar = seek_bar;
+    });
+    sync_tick(hwnd);
 }
 
 fn start_anim(hwnd: HWND, open: bool) {
@@ -443,8 +1082,13 @@ fn start_anim(hwnd: HWND, open: bool) {
     if was == open {
         return;
     }
+    if !open {
+        with(hwnd, |st| {
+            st.hover_hit = None;
+            st.week_off = 0;
+        });
+    }
     unsafe {
-        let _ = KillTimer(Some(hwnd), TIMER_PROGRESS);
         SetTimer(Some(hwnd), TIMER_ANIM, FRAME_MS, None);
     }
 }
@@ -494,7 +1138,7 @@ fn step(hwnd: HWND) {
             unsafe {
                 let _ = KillTimer(Some(hwnd), TIMER_ANIM);
             }
-            sync_progress_timer(hwnd);
+            sync_tick(hwnd);
         }
     }
 }
@@ -518,11 +1162,34 @@ fn near(p: (f32, f32), x: f32, y: f32, r: f32) -> bool {
     (x - p.0).abs() <= r && (y - p.1).abs() <= r
 }
 
+fn hit_at(hwnd: HWND, x: f32, y: f32) -> Option<Hit> {
+    with(hwnd, |st| st.rects.iter().rev().find(|(r, _)| x >= r.0 && x < r.0 + r.2 && y >= r.1 && y < r.1 + r.3).map(|(_, h)| *h)).flatten()
+}
+
+/// Semua notch ikut digambar ulang (timer dibagi bersama).
+fn redraw_all() {
+    let all: Vec<isize> = WINS.with(|w| w.borrow().keys().copied().collect());
+    for h in all {
+        redraw(HWND(h as *mut _));
+    }
+}
+
+fn switch_tab(hwnd: HWND, dir: i32) {
+    let list = tabs();
+    with(hwnd, |st| {
+        let i = list.iter().position(|t| *t == st.tab).unwrap_or(0) as i32;
+        st.tab = list[(i + dir).rem_euclid(list.len() as i32) as usize];
+        st.hover_hit = None;
+    });
+    redraw(hwnd);
+}
+
 fn click(hwnd: HWND, mx: f32, my: f32) {
     let Some((open, s)) = with(hwnd, |st| (st.target_open, st.mon.scale)) else { return };
     if notif_active(hwnd) {
         let (nw, _) = notif_dims(s, dims(s).2);
-        let (cx, cy) = notif_close(8.0 * s, nw, dims(s).2, s);
+        let ear = if pill() { 0.0 } else { 8.0 * s };
+        let (cx, cy) = notif_close(ear, nw, dims(s).2, s);
         if !near((cx, cy), mx, my, 12.0 * s) {
             crate::notifications::activate(); // teruskan klik ke banner aslinya
         }
@@ -530,29 +1197,65 @@ fn click(hwnd: HWND, mx: f32, my: f32) {
         return;
     }
     if open && is_settled_open(hwnd) {
-        let (_, ew, ch, _) = dims(s);
-        let ear = 8.0 * s;
-        let l = layout(ew, ear, ch, s);
-        let r = 22.0 * s;
-        if near(l.prev, mx, my, r) {
-            media::send(Command::Previous);
+        let Some(hit) = hit_at(hwnd, mx, my) else {
+            // Klik di strip atas yang kosong menutup; area isi lainnya tidak berbuat apa-apa.
+            if my < dims(s).2 {
+                start_anim(hwnd, false);
+            }
             return;
+        };
+        match hit {
+            Hit::Tab(t) => {
+                with(hwnd, |st| st.tab = t);
+            }
+            Hit::Settings => {
+                start_anim(hwnd, false);
+                crate::handle_command(crate::IDM_SETTINGS);
+            }
+            Hit::Prev => drop(media::send(Command::Previous)),
+            Hit::Play => drop(media::send(Command::TogglePlayPause)),
+            Hit::Next => drop(media::send(Command::Next)),
+            Hit::Seek => {
+                let info = media::info();
+                let bar = with(hwnd, |st| st.seek_bar).unwrap_or_default();
+                if info.active && info.duration_ms > 0 && bar.2 > 0.0 {
+                    let frac = ((mx - bar.0) / bar.2).clamp(0.0, 1.0);
+                    media::send(Command::Seek((frac * info.duration_ms as f32) as u64));
+                }
+            }
+            Hit::WeekPrev => {
+                with(hwnd, |st| st.week_off -= 1);
+            }
+            Hit::WeekNext => {
+                with(hwnd, |st| st.week_off += 1);
+            }
+            Hit::WeekToday => {
+                with(hwnd, |st| st.week_off = 0);
+            }
+            Hit::ClockToggle => clock(Clock::toggle),
+            Hit::ClockReset => clock(Clock::reset),
+            Hit::Mode(sw) => clock(|c| {
+                if c.stopwatch != sw {
+                    c.reset();
+                    c.stopwatch = sw;
+                }
+            }),
+            Hit::Preset(min) => clock(|c| {
+                c.stopwatch = false;
+                if min == 1 {
+                    c.target += Duration::from_secs(60);
+                    if !c.running() && c.elapsed() >= c.target {
+                        c.acc = Duration::ZERO;
+                    }
+                } else {
+                    c.reset();
+                    c.target = Duration::from_secs(min as u64 * 60);
+                    c.since = Some(Instant::now());
+                }
+            }),
         }
-        if near(l.play, mx, my, r) {
-            media::send(Command::TogglePlayPause);
-            return;
-        }
-        if near(l.next, mx, my, r) {
-            media::send(Command::Next);
-            return;
-        }
-        let (bx, by, bw, bh) = l.bar;
-        let info = media::info();
-        if info.active && info.duration_ms > 0 && mx >= bx - 4.0 * s && mx <= bx + bw + 4.0 * s && (my - (by + bh / 2.0)).abs() <= 10.0 * s {
-            let frac = ((mx - bx) / bw).clamp(0.0, 1.0);
-            media::send(Command::Seek((frac * info.duration_ms as f32) as u64));
-            return;
-        }
+        redraw_all();
+        return;
     }
     start_anim(hwnd, !open);
 }
@@ -578,11 +1281,22 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             if config::current().notch.expand_on_hover {
                 start_anim(hwnd, true);
             }
+            if is_settled_open(hwnd) {
+                let x = (lparam.0 & 0xFFFF) as i16 as f32;
+                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+                let h = hit_at(hwnd, x, y);
+                if with(hwnd, |st| std::mem::replace(&mut st.hover_hit, h) != h).unwrap_or(false) {
+                    redraw(hwnd);
+                }
+            }
             LRESULT(0)
         }
         0x02A3 => {
             // WM_MOUSELEAVE
-            with(hwnd, |st| st.tracking = false);
+            with(hwnd, |st| {
+                st.tracking = false;
+                st.hover_hit = None;
+            });
             if notif_active(hwnd) {
                 with(hwnd, |st| st.hover = false);
                 let dur = config::current().notifications.duration_ms.max(1000);
@@ -597,6 +1311,16 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 unsafe {
                     SetTimer(Some(hwnd), TIMER_CLOSE, d.max(1), None);
                 }
+            }
+            redraw(hwnd);
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            // Gulir di atas notch terbuka = pindah tab (seperti swipe).
+            if is_settled_open(hwnd) {
+                let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
+                let dir = if (msg == WM_MOUSEWHEEL) == (delta < 0) { 1 } else { -1 };
+                switch_tab(hwnd, dir);
             }
             LRESULT(0)
         }
@@ -620,11 +1344,14 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     start_anim(hwnd, false);
                 }
                 TIMER_NOTIF => dismiss_notif(hwnd),
-                TIMER_PROGRESS => {
-                    if is_settled_open(hwnd) && media::info().playing {
-                        redraw(hwnd);
+                TIMER_TICK => {
+                    if check_alarm() {
+                        unsafe {
+                            let _ = windows::Win32::System::Diagnostics::Debug::MessageBeep(MB_ICONASTERISK);
+                        }
+                        redraw_all();
                     } else {
-                        sync_progress_timer(hwnd);
+                        redraw(hwnd);
                     }
                 }
                 _ => {}
@@ -632,5 +1359,33 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil_roundtrip_and_weekday() {
+        let d = days_from_civil(2026, 11, 4);
+        assert_eq!(civil_from_days(d), (2026, 11, 4));
+        assert_eq!(weekday(d), 2, "4 Nov 2026 hari Rabu");
+        assert_eq!(civil_from_days(days_from_civil(2024, 2, 29) + 1), (2024, 3, 1));
+    }
+
+    #[test]
+    fn countdown_text_rounds_up() {
+        let c = Clock { target: Duration::from_secs(300), acc: Duration::from_millis(1500), ..Default::default() };
+        assert_eq!(c.text(false), "4:59");
+        let sw = Clock { stopwatch: true, acc: Duration::from_millis(61_250), ..Default::default() };
+        assert_eq!(sw.text(true), "1:01.2");
+    }
+
+    #[test]
+    fn tab_names() {
+        assert_eq!(Tab::parse(" Media "), Some(Tab::Media));
+        assert_eq!(Tab::parse("system"), Some(Tab::System));
+        assert_eq!(Tab::parse("weather"), None);
     }
 }

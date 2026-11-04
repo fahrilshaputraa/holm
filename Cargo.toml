@@ -48,7 +48,8 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Variant",
     "Win32_System_Com_StructuredStorage",
     "Win32_Media_Audio_Endpoints",
-    "Win32_NetworkManagement_WiFi"
+    "Win32_NetworkManagement_WiFi",
+    "Win32_System_Registry"
 ] }
 windows-core = "0.62.2"
 

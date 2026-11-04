@@ -77,6 +77,87 @@ impl Image {
     }
 }
 
+impl Image {
+    /// Ikon yang hampir seluruhnya gelap (dibuat untuk taskbar terang) diubah menjadi siluet putih
+    /// agar terbaca di bar gelap; ikon berwarna dibiarkan. Mengembalikan true bila diubah.
+    pub fn lighten_if_dark(&self) -> bool {
+        unsafe {
+            let (mut iw, mut ih) = (0u32, 0u32);
+            GdipGetImageWidth(self.bmp as *mut GpImage, &mut iw);
+            GdipGetImageHeight(self.bmp as *mut GpImage, &mut ih);
+            if iw == 0 || ih == 0 || iw > 256 || ih > 256 {
+                return false;
+            }
+            let (mut lum, mut sat, mut n) = (0u64, 0u64, 0u64);
+            for y in 0..ih as i32 {
+                for x in 0..iw as i32 {
+                    let mut c = 0u32;
+                    if GdipBitmapGetPixel(self.bmp, x, y, &mut c).0 != 0 || (c >> 24) < 96 {
+                        continue;
+                    }
+                    let (r, g, b) = ((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+                    lum += ((r * 299 + g * 587 + b * 114) / 1000) as u64;
+                    sat += (r.max(g).max(b) - r.min(g).min(b)) as u64;
+                    n += 1;
+                }
+            }
+            if n == 0 || lum / n > 70 || sat / n > 40 {
+                return false;
+            }
+            for y in 0..ih as i32 {
+                for x in 0..iw as i32 {
+                    let mut c = 0u32;
+                    if GdipBitmapGetPixel(self.bmp, x, y, &mut c).0 == 0 {
+                        GdipBitmapSetPixel(self.bmp, x, y, (c & 0xFF00_0000) | 0x00F2_F2F2);
+                    }
+                }
+            }
+            true
+        }
+    }
+
+    /// Warna rata-rata (sampel 8x8) yang dicerahkan, untuk mewarnai visualizer/progres.
+    /// None bila gambar terlalu abu-abu/gelap untuk menghasilkan warna yang jelas.
+    pub fn tint(&self) -> Option<u32> {
+        unsafe {
+            let (mut iw, mut ih) = (0u32, 0u32);
+            GdipGetImageWidth(self.bmp as *mut GpImage, &mut iw);
+            GdipGetImageHeight(self.bmp as *mut GpImage, &mut ih);
+            if iw == 0 || ih == 0 {
+                return None;
+            }
+            let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+            for i in 0..8 {
+                for j in 0..8 {
+                    let mut c = 0u32;
+                    let (x, y) = ((iw * (2 * i + 1) / 16) as i32, (ih * (2 * j + 1) / 16) as i32);
+                    if GdipBitmapGetPixel(self.bmp, x, y, &mut c).0 != 0 {
+                        continue;
+                    }
+                    let (cr, cg, cb) = ((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+                    // Utamakan piksel berwarna: bobot = saturasi kasar.
+                    let w = cr.max(cg).max(cb) - cr.min(cg).min(cb) + 8;
+                    r += cr * w;
+                    g += cg * w;
+                    b += cb * w;
+                    n += w;
+                }
+            }
+            if n == 0 {
+                return None;
+            }
+            let (r, g, b) = (r / n, g / n, b / n);
+            let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
+            if mx < 24 || mx - mn < 28 {
+                return None;
+            }
+            let k = 235.0 / mx as f32;
+            let f = |v: u32| ((v as f32 * k).min(255.0)) as u32;
+            Some(0xFF00_0000 | (f(r) << 16) | (f(g) << 8) | f(b))
+        }
+    }
+}
+
 impl Drop for Image {
     fn drop(&mut self) {
         unsafe {
@@ -236,6 +317,21 @@ impl Canvas {
             GdipFillPath(self.gfx, b as *mut _, p);
             GdipDeleteBrush(b as *mut _);
             GdipDeletePath(p);
+        }
+    }
+
+    /// Busur lingkaran berpusat (cx, cy) dengan ujung membulat. Sudut dalam derajat, 0 = arah jam 3.
+    pub fn stroke_arc(&self, cx: f32, cy: f32, r: f32, start: f32, sweep: f32, width: f32, color: u32) {
+        if sweep.abs() < 0.1 {
+            return;
+        }
+        unsafe {
+            let mut pen: *mut GpPen = null_mut();
+            GdipCreatePen1(color, width, UnitPixel, &mut pen);
+            GdipSetPenStartCap(pen, LineCapRound);
+            GdipSetPenEndCap(pen, LineCapRound);
+            GdipDrawArc(self.gfx, pen, cx - r, cy - r, 2.0 * r, 2.0 * r, start, sweep);
+            GdipDeletePen(pen);
         }
     }
 

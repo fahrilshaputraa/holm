@@ -4,7 +4,12 @@ Satu aplikasi Rust untuk Windows yang menggabungkan menu bar atas, notch (dynami
 Taskbar Windows disembunyikan lalu dipulihkan saat aplikasi keluar.
 
 - Menu bar: logo Windows, nama aplikasi aktif, menu, Wi-Fi, volume, Bluetooth, baterai, jam (kalender saat diklik).
-- Notch: kontrol media dengan sampul, lirik tersinkron (lrclib.net), dan banner notifikasi Windows.
+- Ikon tray aplikasi (Discord, OneDrive, dll.) pindah ke menu bar: sebagian langsung tampil (ikuti pilihan
+  taskbar Windows, atau atur `[tray]`), sisanya di popup panah. Klik kiri/kanan diteruskan ke aplikasinya.
+  HolmBar menjadi host `Shell_TrayWnd` tanpa menyuntik explorer; semua pesan tetap diteruskan ke Explorer.
+- Notch (bentuk notch atau pill): saat ringkas menampilkan item pilihan di kiri/kanan (sampul, visualizer,
+  judul, timer, baterai, jam, tanggal, CPU); saat terbuka bertab Media (lirik tersinkron lrclib.net),
+  Kalender, Timer/Stopwatch, dan Sistem; plus banner notifikasi Windows.
 - Dock: aplikasi tersemat (termasuk pin taskbar) dan yang berjalan, magnifikasi, tombol Windows.
 - Jendela **Pengaturan**: klik kanan bar/Dock → *Settings...*, menu logo Windows → *HolmBar Settings...*,
   atau jalankan HolmBar sekali lagi. Perubahan langsung diterapkan dan ditulis ke config.toml tanpa menghapus komentar.

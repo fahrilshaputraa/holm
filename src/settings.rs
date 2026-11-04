@@ -8,6 +8,7 @@
 
 use crate::canvas::{Align, Canvas, Font};
 use crate::config;
+use crate::icons::{self, Icon};
 use std::cell::RefCell;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
@@ -30,6 +31,10 @@ const SAVE_DELAY_MS: u32 = 450;
 #[derive(Clone, Copy)]
 enum Kind {
     Toggle,
+    /// Toggle keanggotaan satu item di array config (mis. notch.tabs berisi "timer").
+    Member(&'static str),
+    /// Posisi item notch ringkas: mati / kiri (notch.compact_left) / kanan (notch.compact_right).
+    Slot(&'static str),
     /// (nilai di config, teks yang ditampilkan)
     Choice(&'static [(&'static str, &'static str)]),
     /// unit: "px", "ms", "s" (ms ditampilkan dalam detik), "%" (0–1), "x" (kali), "" (angka)
@@ -68,7 +73,7 @@ struct Group {
 
 struct Section {
     title: &'static str,
-    icon: &'static str,
+    icon: Icon,
     tint: u32,
     groups: &'static [Group],
     footer: &'static str,
@@ -77,7 +82,7 @@ struct Section {
 const SECTIONS: &[Section] = &[
     Section {
         title: "Umum",
-        icon: "\u{E713}",
+        icon: Icon::Gear,
         tint: 0xFF8E8E93,
         groups: &[
             Group {
@@ -100,7 +105,7 @@ const SECTIONS: &[Section] = &[
     },
     Section {
         title: "Menu bar",
-        icon: "\u{E7F4}",
+        icon: Icon::Monitor,
         tint: 0xFF0A84FF,
         groups: &[
             Group {
@@ -128,44 +133,79 @@ const SECTIONS: &[Section] = &[
                     f("bar", "desktop_label", "Nama saat desktop aktif", "Ditampilkan saat explorer.exe di depan", Kind::Text),
                 ],
             },
+            Group {
+                title: "Ikon tray aplikasi",
+                fields: &[
+                    f("tray", "enabled", "Tampilkan ikon tray di menu bar", "Discord, OneDrive, dll. pindah dari taskbar", Kind::Toggle),
+                    f("tray", "inline", "Langsung di bar", "Sisanya di popup panah", Kind::Choice(&[("windows", "Ikuti Windows"), ("all", "Semua"), ("none", "Tidak ada")])),
+                    f("tray", "max_inline", "Maksimal ikon di bar", "", int(0.0, 16.0, 1.0, "")),
+                    f("tray", "icon_size", "Ukuran ikon", "", int(10.0, 20.0, 1.0, "px")),
+                ],
+            },
         ],
-        footer: "Urutan menu dan item di kanan bar diatur di config.toml.",
+        footer: "Urutan item kanan bar (termasuk \"tray\") dan daftar pinned/hidden diatur di config.toml.",
     },
     Section {
         title: "Notch",
-        icon: "\u{E8D6}",
+        icon: Icon::Music,
         tint: 0xFF30D158,
         groups: &[
             Group {
                 title: "",
                 fields: &[
-                    f("notch", "enabled", "Tampilkan notch", "Kontrol media, lirik, dan banner notifikasi", Kind::Toggle),
+                    f("notch", "enabled", "Tampilkan notch", "Live activity, tab, dan banner notifikasi", Kind::Toggle),
+                    f("notch", "style", "Bentuk", "", Kind::Choice(&[("notch", "Notch"), ("pill", "Pill")])),
                     f("notch", "monitors", "Monitor", "", MONITORS),
-                    f("notch", "expand_on_hover", "Buka saat kursor di atasnya", "", Kind::Toggle),
+                    f("notch", "expand_on_hover", "Buka saat kursor di atasnya", "Gulir di atas notch untuk pindah tab", Kind::Toggle),
+                ],
+            },
+            Group {
+                title: "Tab saat terbuka",
+                fields: &[
+                    f("notch", "tabs", "Media", "Sampul, judul, lirik, progres, kontrol", Kind::Member("media")),
+                    f("notch", "tabs", "Kalender", "Tanggal hari ini dan strip satu minggu", Kind::Member("calendar")),
+                    f("notch", "tabs", "Timer & stopwatch", "Hitung mundur dengan preset, atau stopwatch", Kind::Member("timer")),
+                    f("notch", "tabs", "Sistem", "Baterai, CPU, dan RAM", Kind::Member("system")),
+                    f("notch", "default_tab", "Tab pertama", "", Kind::Choice(&[("media", "Media"), ("calendar", "Kalender"), ("timer", "Timer"), ("system", "Sistem")])),
+                ],
+            },
+            Group {
+                title: "Isi notch ringkas",
+                fields: &[
+                    f("notch", "", "Sampul lagu", "Saat musik/video diputar", Kind::Slot("artwork")),
+                    f("notch", "", "Visualizer", "Bar animasi saat musik diputar", Kind::Slot("visualizer")),
+                    f("notch", "", "Judul lagu", "", Kind::Slot("title")),
+                    f("notch", "", "Timer & stopwatch", "Saat timer berjalan atau dijeda", Kind::Slot("timer")),
+                    f("notch", "", "Baterai", "", Kind::Slot("battery")),
+                    f("notch", "", "Jam", "", Kind::Slot("clock")),
+                    f("notch", "", "Tanggal", "", Kind::Slot("date")),
+                    f("notch", "", "CPU", "", Kind::Slot("cpu")),
+                    f("notch", "tint_from_artwork", "Warna dari sampul", "Visualizer & progres mengikuti warna lagu", Kind::Toggle),
                 ],
             },
             Group {
                 title: "Ukuran",
                 fields: &[
+                    f("notch", "compact_height", "Tinggi ringkas", "", int(20.0, 40.0, 1.0, "px")),
                     f("notch", "compact_width", "Lebar ringkas", "", int(120.0, 400.0, 2.0, "px")),
-                    f("notch", "expanded_width", "Lebar terbuka", "", int(300.0, 800.0, 4.0, "px")),
-                    f("notch", "expanded_height", "Tinggi terbuka", "", int(150.0, 400.0, 2.0, "px")),
+                    f("notch", "expanded_width", "Lebar terbuka", "", int(360.0, 800.0, 4.0, "px")),
+                    f("notch", "expanded_height", "Tinggi terbuka", "", int(110.0, 300.0, 2.0, "px")),
                 ],
             },
             Group {
                 title: "Gaya & animasi",
                 fields: &[
-                    f("notch", "accent", "Warna aksen", "Progres lagu dan sorotan", Kind::Color),
+                    f("notch", "accent", "Warna aksen", "Dipakai bila warna sampul tidak tersedia", Kind::Color),
                     f("notch", "close_delay_ms", "Jeda sebelum menutup", "", int(0.0, 2000.0, 50.0, "ms")),
                     f("notch", "animation_ms", "Durasi animasi", "", int(0.0, 600.0, 10.0, "ms")),
                 ],
             },
         ],
-        footer: "",
+        footer: "Urutan item (pertama = paling luar) bisa diubah di config.toml: notch.compact_left / compact_right.",
     },
     Section {
         title: "Dock",
-        icon: "\u{ECAA}",
+        icon: Icon::Apps,
         tint: 0xFFBF5AF2,
         groups: &[
             Group {
@@ -198,7 +238,7 @@ const SECTIONS: &[Section] = &[
     },
     Section {
         title: "Notifikasi",
-        icon: "\u{EA8F}",
+        icon: Icon::Bell,
         tint: 0xFFFF453A,
         groups: &[Group {
             title: "",
@@ -265,6 +305,8 @@ struct St {
     drag: Option<(usize, f32, f32)>, // field, x awal track, lebar track
     editing: Option<(usize, String)>,
     recording: Option<usize>,
+    /// Dropdown pilihan yang sedang terbuka (indeks field).
+    open_dd: Option<usize>,
     status: Option<(String, bool)>, // (pesan, error?)
 }
 
@@ -332,7 +374,20 @@ pub fn open() {
         return;
     }
     let merged = config::merged_value().ok();
-    let values = all_fields().iter().map(|(_, f)| merged.as_ref().and_then(|m| m.get(f.sec)?.get(f.key).cloned())).collect();
+    let values = all_fields()
+        .iter()
+        .map(|(_, f)| {
+            let v = merged.as_ref().and_then(|m| m.get(f.sec)?.get(f.key).cloned());
+            match f.kind {
+                Kind::Member(item) => Some(toml::Value::Boolean(member_of(v.as_ref(), item))),
+                Kind::Slot(item) => {
+                    let side = |k: &str| member_of(merged.as_ref().and_then(|m| m.get(f.sec)?.get(k)), item);
+                    Some(toml::Value::String(if side("compact_left") { "left" } else if side("compact_right") { "right" } else { "off" }.into()))
+                }
+                _ => v,
+            }
+        })
+        .collect();
     unsafe {
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
@@ -364,6 +419,7 @@ pub fn open() {
                 drag: None,
                 editing: None,
                 recording: None,
+                open_dd: None,
                 status: None,
             })
         });
@@ -462,42 +518,102 @@ fn to_edit(v: &toml::Value) -> toml_edit::Value {
     }
 }
 
-/// Ganti/tambah satu kunci; komentar di belakang nilai lama dipertahankan.
-fn set_key(doc: &mut toml_edit::DocumentMut, sec: &str, key: &str, v: toml_edit::Value) -> Result<(), String> {
-    let table = doc.entry(sec).or_insert(toml_edit::table());
-    let Some(table) = table.as_table_like_mut() else {
-        return Err(format!("[{sec}] di config.toml bukan tabel."));
-    };
-    match table.get_mut(key).and_then(|i| i.as_value_mut()) {
-        Some(old) => {
-            let decor = old.decor().clone();
-            *old = v;
-            *old.decor_mut() = decor;
-        }
-        None => {
-            table.insert(key, toml_edit::Item::Value(v));
+fn member_of(v: Option<&toml::Value>, item: &str) -> bool {
+    v.and_then(|v| v.as_array()).map(|a| a.iter().any(|x| x.as_str().map(|s| s.eq_ignore_ascii_case(item)).unwrap_or(false))).unwrap_or(false)
+}
+
+fn str_array(v: Option<&toml::Value>) -> Vec<String> {
+    v.and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default()
+}
+
+/// Susun ulang array dari toggle `Member`: urutan item lama dipertahankan, item baru ditambah di belakang.
+fn member_arrays(current: &toml::Value, values: &[Option<toml::Value>]) -> Vec<(&'static str, &'static str, Vec<String>)> {
+    let fields = all_fields();
+    let mut keys: Vec<(&'static str, &'static str)> = Vec::new();
+    for (_, f) in &fields {
+        if matches!(f.kind, Kind::Member(_)) && !keys.contains(&(f.sec, f.key)) {
+            keys.push((f.sec, f.key));
         }
     }
-    Ok(())
+    let toggles = |sec: &str, key: &str| -> Vec<(&'static str, bool)> {
+        fields
+            .iter()
+            .zip(values)
+            .filter_map(|((_, f), v)| match f.kind {
+                Kind::Member(i) if f.sec == sec && f.key == key => Some((i, v.as_ref().and_then(|v| v.as_bool()).unwrap_or(false))),
+                _ => None,
+            })
+            .collect()
+    };
+    keys.into_iter()
+        .map(|(sec, key)| {
+            let t = toggles(sec, key);
+            let on = |item: &str| t.iter().find(|(i, _)| i.eq_ignore_ascii_case(item)).map(|(_, b)| *b);
+            let old = str_array(current.get(sec).and_then(|x| x.get(key)));
+            let mut out: Vec<String> = old.iter().filter(|i| on(i).unwrap_or(true)).cloned().collect();
+            for (i, b) in &t {
+                if *b && !out.iter().any(|o| o.eq_ignore_ascii_case(i)) {
+                    out.push(i.to_string());
+                }
+            }
+            (sec, key, out)
+        })
+        .collect()
+}
+
+/// Susun ulang notch.compact_left/right dari pilihan Slot: urutan lama dipertahankan,
+/// item yang pindah sisi ditambah di bagian dalam (belakang daftar).
+fn slot_arrays(current: &toml::Value, values: &[Option<toml::Value>]) -> Vec<(&'static str, &'static str, Vec<String>)> {
+    let choice: Vec<(&'static str, String)> = all_fields()
+        .iter()
+        .zip(values)
+        .filter_map(|((_, f), v)| match f.kind {
+            Kind::Slot(i) => Some((i, v.as_ref().and_then(|v| v.as_str()).unwrap_or("off").to_string())),
+            _ => None,
+        })
+        .collect();
+    if choice.is_empty() {
+        return Vec::new();
+    }
+    let want = |item: &str| choice.iter().find(|(i, _)| i.eq_ignore_ascii_case(item)).map(|(_, c)| c.as_str());
+    [("compact_left", "left"), ("compact_right", "right")]
+        .into_iter()
+        .map(|(key, side)| {
+            let old = str_array(current.get("notch").and_then(|t| t.get(key)));
+            let mut out: Vec<String> = old.into_iter().filter(|i| want(i).map(|c| c == side).unwrap_or(true)).collect();
+            for (i, c) in &choice {
+                if c == side && !out.iter().any(|o| o.eq_ignore_ascii_case(i)) {
+                    out.push(i.to_string());
+                }
+            }
+            ("notch", key, out)
+        })
+        .collect()
 }
 
 /// Tulis kunci yang berubah ke config.toml lalu muat ulang.
 fn write_changes(values: &[Option<toml::Value>]) -> Result<bool, String> {
     let current = config::merged_value().map_err(|e| format!("config.toml berisi kesalahan: {e}"))?;
     let fields = all_fields();
-    let changes: Vec<_> = fields
+    let mut changes: Vec<(&str, &str, toml_edit::Value)> = fields
         .iter()
         .zip(values)
-        .filter_map(|((_, f), v)| v.as_ref().filter(|v| !same(current.get(f.sec).and_then(|t| t.get(f.key)), v)).map(|v| (*f, v)))
+        .filter(|((_, f), _)| !matches!(f.kind, Kind::Member(_) | Kind::Slot(_)))
+        .filter_map(|((_, f), v)| v.as_ref().filter(|v| !same(current.get(f.sec).and_then(|t| t.get(f.key)), v)).map(|v| (f.sec, f.key, to_edit(v))))
         .collect();
+    for (sec, key, items) in member_arrays(&current, values).into_iter().chain(slot_arrays(&current, values)) {
+        if str_array(current.get(sec).and_then(|t| t.get(key))) != items {
+            changes.push((sec, key, toml_edit::Value::Array(items.iter().map(String::as_str).collect())));
+        }
+    }
     if changes.is_empty() {
         return Ok(false);
     }
     let path = config::path();
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| format!("Gagal membaca config.toml: {e}"))?;
-    for (f, v) in changes {
-        set_key(&mut doc, f.sec, f.key, to_edit(v))?;
+    for (sec, key, v) in changes {
+        config::set_key(&mut doc, sec, key, v)?;
     }
     let out = doc.to_string();
     config::validate(&out).map_err(|e| format!("Tidak valid: {e}"))?;
@@ -533,20 +649,16 @@ struct Fonts {
     group: Font,
     title: Font,
     app: Font,
-    icon: Font,
-    icon_s: Font,
 }
 
 fn fonts(s: f32) -> Fonts {
-    let (ui, disp, ic) = ("Segoe UI Variable Text", "Segoe UI Variable Display", "Segoe Fluent Icons");
+    let (ui, disp) = ("Segoe UI Variable Text", "Segoe UI Variable Display");
     Fonts {
         body: Font::new(ui, 13.0 * s, false),
         small: Font::new(ui, 11.5 * s, false),
         group: Font::new(ui, 12.0 * s, true),
         title: Font::new(disp, 20.0 * s, true),
         app: Font::new(disp, 15.0 * s, true),
-        icon: Font::new(ic, 13.0 * s, false),
-        icon_s: Font::new(ic, 8.0 * s, false),
     }
 }
 
@@ -597,7 +709,7 @@ fn render(st: &mut St) {
     let close_r = (lx - d(4.0), ly - d(4.0), ld + d(8.0), ld + d(8.0));
     c.fill_ellipse(lx, ly, ld, ld, 0xFFFF5F57);
     if hover == Some(Hit::Close) {
-        c.text("\u{E8BB}", &ft.icon_s, (lx, ly, ld, ld), 0xAA4D0000, Align::Center);
+        icons::draw(&c, Icon::Close, (lx + d(3.0), ly + d(3.0), ld - d(6.0), ld - d(6.0)), 0xAA4D0000, 0xFFFF5F57);
     }
     rects.push((close_r, Hit::Close));
     for i in 1..3 {
@@ -618,23 +730,23 @@ fn render(st: &mut St) {
         }
         let ic = (r.0 + d(8.0), r.1 + d(5.0), d(22.0), d(22.0));
         round(&c, ic, d(6.0), sec.tint);
-        c.text(sec.icon, &ft.icon, ic, 0xFFFFFFFF, Align::Center);
+        icons::draw(&c, sec.icon, (ic.0 + d(4.0), ic.1 + d(4.0), ic.2 - d(8.0), ic.3 - d(8.0)), 0xFFFFFFFF, sec.tint);
         c.text(sec.title, &ft.body, (r.0 + d(40.0), r.1, r.2 - d(46.0), r.3), TEXT, Align::Near);
         rects.push((r, Hit::Section(i)));
     }
 
     // Status simpan + tautan file config di bawah sidebar.
     if let Some((msg, err)) = &st.status {
-        let (color, icon) = if *err { (ERR, "\u{E783}") } else { (OK, "\u{E73E}") };
+        let (color, icon) = if *err { (ERR, Icon::Warning) } else { (OK, Icon::Check) };
         let r = (x0 + d(20.0), y0 + ch - d(80.0), d(SB - 36.0), d(20.0));
-        c.text(icon, &ft.icon, (r.0, r.1, d(16.0), r.3), color, Align::Near);
+        icons::draw(&c, icon, (r.0, r.1 + d(2.0), d(15.0), d(15.0)), color, SIDEBAR);
         c.text(msg, &ft.small, (r.0 + d(20.0), r.1, r.2 - d(20.0), r.3), color, Align::Near);
     }
     let of = (x0 + d(10.0), y0 + ch - d(50.0), d(SB - 20.0), d(32.0));
     if hover == Some(Hit::OpenFile) {
         round(&c, of, d(7.0), HOVER);
     }
-    c.text("\u{E8A5}", &ft.icon, (of.0 + d(12.0), of.1, d(18.0), of.3), DIM, Align::Center);
+    icons::draw(&c, Icon::Document, (of.0 + d(13.0), of.1 + d(8.0), d(16.0), d(16.0)), DIM, if hover == Some(Hit::OpenFile) { 0xFF323237 } else { SIDEBAR });
     c.text("Buka config.toml", &ft.body, (of.0 + d(40.0), of.1, of.2 - d(46.0), of.3), DIM, Align::Near);
     rects.push((of, Hit::OpenFile));
 
@@ -650,6 +762,7 @@ fn render(st: &mut St) {
 
     let base = fields.iter().position(|(si, _)| *si == st.section).unwrap_or(0);
     let mut idx = base;
+    let mut overlay: Option<(usize, Rect)> = None;
     let mut y = top + d(4.0) - st.scroll;
     let (card_x, card_w) = (cx + d(24.0), cwid - d(48.0));
     for g in sec.groups {
@@ -680,7 +793,7 @@ fn render(st: &mut St) {
                 }
             };
             match field.kind {
-                Kind::Toggle => {
+                Kind::Toggle | Kind::Member(_) => {
                     let on = val.and_then(|v| v.as_bool()).unwrap_or(false);
                     let r = (rx - d(40.0), cy - d(12.0), d(40.0), d(24.0));
                     round(&c, r, d(12.0), if on { accent } else { TRACK });
@@ -688,8 +801,24 @@ fn render(st: &mut St) {
                     c.fill_ellipse(kx, r.1 + d(2.0), d(20.0), d(20.0), 0xFFFFFFFF);
                     push((r.0 - d(6.0), ry, r.2 + d(12.0), d(ROW)), Hit::Field(idx));
                 }
-                Kind::Choice(opts) => {
+                Kind::Choice(_) | Kind::Slot(_) => {
+                    let opts = choice_opts(field.kind);
                     let cur = val.and_then(|v| v.as_str()).unwrap_or("");
+                    if opts.len() > DROPDOWN_MIN {
+                        let label = opts.iter().find(|(v, _)| *v == cur).map(|(_, t)| *t).unwrap_or("-");
+                        let bw = opts.iter().map(|(_, t)| c.measure(t, &ft.body)).fold(0.0f32, f32::max) + d(52.0);
+                        let r = (rx - bw, cy - d(14.0), bw, d(28.0));
+                        let open = st.open_dd == Some(idx);
+                        framed(&c, r, d(8.0), d(if open { 2.0 } else { 1.0 }), if open { accent } else if hover == Some(Hit::Field(idx)) { 0xFF5A5A62 } else { 0xFF44444B }, 0xFF3A3A40);
+                        c.text(label, &ft.body, (r.0 + d(12.0), r.1, r.2 - d(36.0), r.3), TEXT, Align::Near);
+                        icons::draw(&c, if open { Icon::ChevronUp } else { Icon::ChevronDown }, (r.0 + r.2 - d(24.0), r.1 + d(8.0), d(12.0), d(12.0)), DIM, 0xFF3A3A40);
+                        push(r, Hit::Field(idx));
+                        if open {
+                            overlay = Some((idx, r));
+                        }
+                        idx += 1;
+                        continue;
+                    }
                     let seg_w = opts.iter().map(|(_, t)| c.measure(t, &ft.body)).fold(0.0f32, f32::max) + d(26.0);
                     let total = seg_w * opts.len() as f32 + d(4.0);
                     let r = (rx - total, cy - d(14.0), total, d(28.0));
@@ -767,7 +896,7 @@ fn render(st: &mut St) {
                     if !rec && !cur.is_empty() {
                         let x = (r.0 + r.2 - d(24.0), cy - d(9.0), d(18.0), d(18.0));
                         c.fill_ellipse(x.0, x.1, x.2, x.3, if hover == Some(Hit::Clear(idx)) { 0xFF6A6A72 } else { 0xFF48484F });
-                        c.text("\u{E8BB}", &ft.icon_s, x, TEXT, Align::Center);
+                        icons::draw(&c, Icon::Close, (x.0 + d(5.0), x.1 + d(5.0), x.2 - d(10.0), x.3 - d(10.0)), TEXT, 0xFF48484F);
                         push(x, Hit::Clear(idx));
                     }
                 }
@@ -781,6 +910,36 @@ fn render(st: &mut St) {
         y += d(14.0);
     }
     c.reset_clip();
+    if let Some((i, r)) = overlay {
+        let opts = choice_opts(field(i).kind);
+        let cur = st.values[i].as_ref().and_then(|v| v.as_str()).unwrap_or("");
+        let (rowh, padv) = (d(32.0), d(6.0));
+        let lw = opts.iter().map(|(_, t)| c.measure(t, &ft.body)).fold(0.0f32, f32::max) + d(56.0);
+        let (ow, oh) = (lw.max(r.2), opts.len() as f32 * rowh + 2.0 * padv);
+        let mut oy = r.1 + r.3 + d(4.0);
+        if oy + oh > y0 + ch - d(8.0) {
+            oy = r.1 - oh - d(4.0); // tidak muat di bawah: buka ke atas
+        }
+        let ox = r.0 + r.2 - ow;
+        for k in 1..=6 {
+            let k = d(k as f32);
+            c.fill_round_rect(ox - k, oy - k + d(3.0), ow + 2.0 * k, oh + 2.0 * k, (d(10.0) + k, d(10.0) + k, d(10.0) + k, d(10.0) + k), 0x0C000000);
+        }
+        framed(&c, (ox, oy, ow, oh), d(10.0), d(1.0), 0xFF4A4A52, 0xFF2E2E33);
+        for (j, (v, t)) in opts.iter().enumerate() {
+            let rr = (ox + padv, oy + padv + j as f32 * rowh, ow - 2.0 * padv, rowh);
+            let sel = *v == cur;
+            if hover == Some(Hit::Seg(i, j)) {
+                round(&c, rr, d(6.0), accent);
+            }
+            let on_accent = hover == Some(Hit::Seg(i, j));
+            c.text(t, &ft.body, (rr.0 + d(30.0), rr.1, rr.2 - d(36.0), rr.3), TEXT, Align::Near);
+            if sel {
+                icons::draw(&c, Icon::Check, (rr.0 + d(8.0), rr.1 + d(9.0), d(14.0), d(14.0)), if on_accent { 0xFFFFFFFF } else { accent }, if on_accent { accent } else { 0xFF2E2E33 });
+            }
+            rects.push((rr, Hit::Seg(i, j)));
+        }
+    }
     st.max_scroll = (y + st.scroll - top - (bottom - top) + d(8.0)).max(0.0);
     if st.scroll > st.max_scroll {
         st.scroll = st.max_scroll;
@@ -805,6 +964,19 @@ fn xy(lp: LPARAM) -> (f32, f32) {
 
 fn hit_at(x: f32, y: f32) -> Option<Hit> {
     with(|st| st.rects.iter().rev().find(|(r, _)| x >= r.0 && x < r.0 + r.2 && y >= r.1 && y < r.1 + r.3).map(|(_, h)| *h)).flatten()
+}
+
+/// Pilihan dengan lebih dari ini ditampilkan sebagai dropdown, bukan baris segmented.
+const DROPDOWN_MIN: usize = 3;
+
+const SLOT_OPTS: &[(&str, &str)] = &[("off", "Mati"), ("left", "Kiri"), ("right", "Kanan")];
+
+fn choice_opts(kind: Kind) -> &'static [(&'static str, &'static str)] {
+    match kind {
+        Kind::Choice(o) => o,
+        Kind::Slot(_) => SLOT_OPTS,
+        _ => &[],
+    }
 }
 
 fn field(i: usize) -> &'static Field {
@@ -858,6 +1030,11 @@ fn click(hwnd: HWND, x: f32, y: f32) {
     if !matches!(hit, Some(Hit::Field(i)) if with(|st| st.recording == Some(i)).unwrap_or(false)) {
         with(|st| st.recording = None);
     }
+    // Dropdown terbuka: klik di luar daftarnya menutup (klik pada tombolnya sendiri diurus di bawah).
+    let dd = with(|st| st.open_dd).flatten();
+    if dd.is_some() && !matches!(hit, Some(Hit::Seg(..))) && hit != dd.map(Hit::Field) {
+        with(|st| st.open_dd = None);
+    }
     match hit {
         Some(Hit::Close) => close(),
         Some(Hit::Section(i)) => {
@@ -868,13 +1045,14 @@ fn click(hwnd: HWND, x: f32, y: f32) {
         }
         Some(Hit::OpenFile) => crate::open_config(),
         Some(Hit::Seg(i, j)) => {
-            if let Kind::Choice(opts) = field(i).kind {
-                set_value(i, toml::Value::String(opts[j].0.to_string()));
+            if let Some((v, _)) = choice_opts(field(i).kind).get(j) {
+                set_value(i, toml::Value::String(v.to_string()));
             }
+            with(|st| st.open_dd = None);
         }
         Some(Hit::Clear(i)) => set_value(i, toml::Value::String(String::new())),
         Some(Hit::Field(i)) => match field(i).kind {
-            Kind::Toggle => {
+            Kind::Toggle | Kind::Member(_) => {
                 let on = with(|st| st.values[i].as_ref().and_then(|v| v.as_bool()).unwrap_or(false)).unwrap_or(false);
                 set_value(i, toml::Value::Boolean(!on));
             }
@@ -902,7 +1080,9 @@ fn click(hwnd: HWND, x: f32, y: f32) {
             Kind::Hotkey => {
                 with(|st| st.recording = Some(i));
             }
-            Kind::Choice(_) => {}
+            Kind::Choice(_) | Kind::Slot(_) => {
+                with(|st| st.open_dd = if st.open_dd == Some(i) { None } else { Some(i) });
+            }
         },
         None => {}
     }
@@ -990,6 +1170,10 @@ fn key_down(vk: u16) -> bool {
         return true;
     }
 
+    if vk == 0x1B && with(|st| st.open_dd.take().is_some()).unwrap_or(false) {
+        redraw();
+        return true;
+    }
     match vk {
         0x1B => close(),
         0x26 | 0x28 => {
@@ -1187,8 +1371,8 @@ mod tests {
     #[test]
     fn set_key_keeps_comments_and_adds_missing() {
         let mut doc: toml_edit::DocumentMut = "# atas\n[bar]\nheight = 32   # tinggi\nfont = \"A\"\n".parse().unwrap();
-        set_key(&mut doc, "bar", "height", toml_edit::Value::from(40i64)).unwrap();
-        set_key(&mut doc, "dock", "opacity", toml_edit::Value::from(0.5f64)).unwrap();
+        config::set_key(&mut doc, "bar", "height", toml_edit::Value::from(40i64)).unwrap();
+        config::set_key(&mut doc, "dock", "opacity", toml_edit::Value::from(0.5f64)).unwrap();
         let out = doc.to_string();
         assert!(out.contains("# atas"));
         assert!(out.contains("height = 40   # tinggi"), "{out}");
@@ -1200,9 +1384,31 @@ mod tests {
     #[test]
     fn every_field_exists_in_defaults() {
         let v = config::merged_value().unwrap();
-        for (_, f) in all_fields() {
+        for (_, f) in all_fields().into_iter().filter(|(_, f)| !matches!(f.kind, Kind::Slot(_))) {
             assert!(v.get(f.sec).and_then(|t| t.get(f.key)).is_some(), "{}.{} tidak ada di default_config.toml", f.sec, f.key);
         }
+    }
+
+    #[test]
+    fn member_toggles_keep_order_and_append() {
+        let current: toml::Value = toml::from_str("[notch]\ntabs = [\"timer\", \"media\"]\nlive = [\"media\"]\n").unwrap();
+        let fields = all_fields();
+        let values: Vec<Option<toml::Value>> = fields
+            .iter()
+            .map(|(_, f)| match f.kind {
+                Kind::Member(i) => Some(toml::Value::Boolean(matches!((f.key, i), ("tabs", "timer") | ("tabs", "system")))),
+                Kind::Slot(i) => Some(toml::Value::String(match i { "clock" => "left", "artwork" | "visualizer" => "right", _ => "off" }.into())),
+                _ => None,
+            })
+            .collect();
+        let arrays = member_arrays(&current, &values);
+        let tabs = arrays.iter().find(|(_, k, _)| *k == "tabs").unwrap();
+        assert_eq!(tabs.2, vec!["timer".to_string(), "system".to_string()], "media dimatikan, system ditambah di belakang");
+        assert!(arrays.iter().all(|(_, k, _)| *k == "tabs"), "hanya array Member");
+        let cur: toml::Value = toml::from_str("[notch]\ncompact_left = [\"artwork\"]\ncompact_right = [\"timer\", \"visualizer\"]\n").unwrap();
+        let slots = slot_arrays(&cur, &values);
+        assert_eq!(slots[0].2, vec!["clock".to_string()], "artwork pindah ke kanan, clock ditambah di kiri");
+        assert_eq!(slots[1].2, vec!["visualizer".to_string(), "artwork".to_string()], "timer dimatikan");
     }
 
     #[test]

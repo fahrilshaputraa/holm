@@ -4,6 +4,7 @@
 # Warna: "#RRGGBB" atau "#AARRGGBB".
 
 [general]
+config_version = 3         # dipakai untuk migrasi otomatis; jangan diubah
 language = "id"            # "id" | "en"  (nama hari & bulan pada jam)
 accent = "#0A84FF"          # warna sorotan popup (kalender, slider, pilihan)
 
@@ -21,23 +22,41 @@ font_size = 12.5
 logo = ""
 desktop_label = "Finder"           # nama yang tampil saat explorer.exe aktif
 menus = ["File", "Edit", "View", "Window", "Help"]
-# Urutan kiri -> kanan. Pilihan: wifi, volume, bluetooth, battery, control_center, clock
-right = ["bluetooth", "wifi", "volume", "battery", "control_center", "clock"]
+# Urutan kiri -> kanan. Pilihan: tray, wifi, volume, bluetooth, battery, control_center, clock
+right = ["tray", "bluetooth", "wifi", "volume", "battery", "control_center", "clock"]
 # Token: %a %A %d %b %B %m %Y %y %H %M
 clock_format = "%a %d %b  %H:%M"
 
 [notch]
 enabled = true
 monitors = "all"             # "all" | "primary"
+style = "notch"              # "notch" (menyatu dengan bar) | "pill" (pulau melayang)
 background = "#000000"
 accent = "#1DB954"
+tint_from_artwork = true     # warna visualizer & progres mengikuti sampul lagu
 compact_width = 210
-compact_height = 32
-expanded_width = 440
-expanded_height = 232
+compact_height = 28
+expanded_width = 480
+expanded_height = 132
+# Tab saat notch terbuka (urutan = urutan ikon). Pilihan: media, calendar, timer, system
+tabs = ["media", "calendar", "timer", "system"]
+default_tab = "media"
+# Isi notch ringkas di kiri dan kanan (item pertama = paling luar; yang tidak relevan disembunyikan).
+# Pilihan: artwork, visualizer, title, timer, battery, clock, date, cpu
+compact_left = ["artwork"]
+compact_right = ["timer", "visualizer"]
 expand_on_hover = true
 close_delay_ms = 400
 animation_ms = 180
+
+[tray]
+# Ikon tray aplikasi (Discord, OneDrive, dll.) dipindah dari taskbar ke menu bar (item "tray" di bar.right).
+enabled = true
+inline = "windows"      # ikon langsung di bar: "windows" (ikuti pilihan taskbar Windows) | "all" | "none"
+max_inline = 6          # sisanya di popup (klik panah)
+icon_size = 13          # ukuran ikon di bar (px)
+pinned = []             # selalu langsung di bar, mis. ["discord.exe", "onedrive"] (nama exe atau teks tooltip)
+hidden = []             # tidak pernah ditampilkan
 
 [lyrics]
 # Mengambil lirik dari lrclib.net (hanya judul, artis, dan durasi lagu yang dikirim).

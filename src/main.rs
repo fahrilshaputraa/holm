@@ -4,6 +4,7 @@ mod bar;
 mod canvas;
 mod config;
 mod dock;
+mod icons;
 mod lyrics;
 mod media;
 mod menus;
@@ -15,6 +16,7 @@ mod radios;
 mod settings;
 mod status;
 mod taskbar;
+mod tray;
 
 use canvas::wide;
 use std::cell::RefCell;
@@ -281,6 +283,7 @@ pub(crate) fn reload_config() {
         rebuild();
         register_hotkey();
         start_notifications();
+        tray::sync();
     }
     if let Ok(mut s) = CONFIG_STAMP.lock() {
         *s = config::mtime();
@@ -289,6 +292,7 @@ pub(crate) fn reload_config() {
 
 fn quit() {
     QUITTING.store(true, Ordering::SeqCst);
+    tray::stop();
     taskbar::restore();
     destroy_all();
     unsafe { PostQuitMessage(0) };
@@ -366,12 +370,25 @@ unsafe extern "system" fn bar_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     bar::Action::Popup(kind) => popup::toggle(kind, (x0 + x1) / 2.0, mon),
                     bar::Action::Uri(u) if !u.is_empty() => open_uri(u),
                     bar::Action::Uri(_) => {}
+                    bar::Action::Tray(id) => tray::click(id, false, false, (((x0 + x1) / 2.0) as i32, below)),
                 }
             }
             LRESULT(0)
         }
+        WM_LBUTTONDBLCLK => {
+            let x = (lparam.0 & 0xFFFF) as i16 as f32;
+            if let Some((bar::Action::Tray(id), x0, x1, mon, bar_h)) = bar::hit_test(hwnd, x) {
+                tray::click(id, false, true, (((x0 + x1) / 2.0) as i32, mon.y + bar_h));
+            }
+            LRESULT(0)
+        }
         WM_RBUTTONUP => {
-            show_menu(hwnd);
+            // Klik kanan ikon tray = menu aplikasinya; di tempat lain = menu HolmBar.
+            let x = (lparam.0 & 0xFFFF) as i16 as f32;
+            match bar::hit_test(hwnd, x) {
+                Some((bar::Action::Tray(id), x0, x1, mon, bar_h)) => tray::click(id, true, false, (((x0 + x1) / 2.0) as i32, mon.y + bar_h)),
+                _ => show_menu(hwnd),
+            }
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -429,6 +446,8 @@ fn register_classes() {
         ] {
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                // Klik ganda di bar diteruskan ke ikon tray (beberapa aplikasi membuka jendela dengan klik ganda).
+                style: if name == &class_bar { CS_DBLCLKS } else { WNDCLASS_STYLES(0) },
                 lpfnWndProc: proc,
                 hInstance: hinst,
                 hCursor: cursor,
@@ -464,6 +483,10 @@ fn handle_thread_message(msg: &MSG) {
             notches().into_iter().for_each(|h| notch::notify(h, (*t).clone()));
         }
         WM_REBUILD => rebuild(),
+        tray::WM_TRAY_CHANGED => {
+            bars().into_iter().for_each(bar::redraw);
+            popup::on_tray_changed();
+        }
         WM_HOTKEY => popup::open_launcher(),
         _ => {}
     }
@@ -504,6 +527,7 @@ fn main() {
         media::start(tid);
         status::start(tid);
         start_notifications();
+        tray::sync();
         if bar::on_foreground(GetForegroundWindow()) {
             bars().into_iter().for_each(bar::redraw);
         }

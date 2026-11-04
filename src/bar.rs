@@ -23,6 +23,8 @@ pub enum Action {
     AppMenu(usize),
     Popup(crate::popup::Kind),
     Uri(&'static str),
+    /// Ikon tray aplikasi (id dari tray.rs).
+    Tray(u64),
 }
 
 struct Hit {
@@ -60,7 +62,7 @@ pub fn detach(hwnd: HWND) {
     WINS.with(|w| w.borrow_mut().remove(&(hwnd.0 as isize)));
 }
 
-fn battery() -> Option<(u8, bool)> {
+pub(crate) fn battery() -> Option<(u8, bool)> {
     unsafe {
         let mut s: SYSTEM_POWER_STATUS = zeroed();
         if GetSystemPowerStatus(&mut s).is_err() || s.BatteryFlag & 128 != 0 || s.BatteryLifePercent > 100 {
@@ -199,7 +201,7 @@ pub fn redraw(hwnd: HWND) {
     let Some((w, h, s)) = with_win(hwnd, |win| (win.width, win.height, win.mon.scale)) else { return };
     let vol = crate::status::volume();
     let wifi = crate::status::wifi();
-    let sig = format!("{app}|{clock}|{bat:?}|{vol:?}|{wifi:?}|{w}x{h}x{s}");
+    let sig = format!("{app}|{clock}|{bat:?}|{vol:?}|{wifi:?}|{w}x{h}x{s}|t{}", crate::tray::revision());
     if with_win(hwnd, |win| win.sig == sig).unwrap_or(true) {
         return;
     }
@@ -256,6 +258,28 @@ pub fn redraw(hwnd: HWND) {
     let gap = 14.0 * s;
     for item in cfg.bar.right.iter().rev() {
         let (width, action): (f32, Option<Action>) = match item.as_str() {
+            "tray" => {
+                // Ikon tray: panah overflow paling kanan, ikon langsung di kirinya.
+                let (inline, overflow) = crate::tray::split();
+                let isz = cfg.tray.icon_size.clamp(10, 20) as f32 * s;
+                let igap = 8.0 * s;
+                let mut used = 0.0f32;
+                if !overflow.is_empty() {
+                    let cw = 12.0 * s;
+                    crate::icons::draw(&c, crate::icons::Icon::ChevronDown, (rx - cw, (fh - cw) / 2.0, cw, cw), dim, bg);
+                    hits.push(Hit { x0: rx - cw - 6.0 * s, x1: rx + gap / 2.0, action: Action::Popup(crate::popup::Kind::Tray) });
+                    used = cw + igap;
+                }
+                for v in inline.iter().rev() {
+                    let x = rx - used - isz;
+                    if let Some(img) = &v.image {
+                        c.draw_image(img, x, (fh - isz) / 2.0, isz, isz, 0.0, 1.0);
+                    }
+                    hits.push(Hit { x0: x - igap / 2.0, x1: x + isz + igap / 2.0, action: Action::Tray(v.id) });
+                    used += isz + igap;
+                }
+                ((used - igap).max(0.0), None)
+            }
             "clock" => {
                 let cw = c.measure(&clock, &bold);
                 c.text(&clock, &bold, (rx - cw, 0.0, cw + 4.0, fh), text, Align::Near);

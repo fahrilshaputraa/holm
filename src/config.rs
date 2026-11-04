@@ -15,6 +15,17 @@ pub struct Config {
     pub dock: Dock,
     pub launcher: Launcher,
     pub notifications: Notifications,
+    pub tray: Tray,
+}
+
+#[derive(Deserialize)]
+pub struct Tray {
+    pub enabled: bool,
+    pub inline: String,
+    pub max_inline: i32,
+    pub icon_size: i32,
+    pub pinned: Vec<String>,
+    pub hidden: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -79,8 +90,14 @@ pub struct Bar {
 pub struct Notch {
     pub enabled: bool,
     pub monitors: String,
+    pub style: String,
     pub background: String,
     pub accent: String,
+    pub tint_from_artwork: bool,
+    pub tabs: Vec<String>,
+    pub default_tab: String,
+    pub compact_left: Vec<String>,
+    pub compact_right: Vec<String>,
     pub compact_width: i32,
     pub compact_height: i32,
     pub expanded_width: i32,
@@ -109,6 +126,68 @@ pub fn path() -> PathBuf {
 
 pub fn mtime() -> Option<SystemTime> {
     std::fs::metadata(path()).and_then(|m| m.modified()).ok()
+}
+
+/// Ganti/tambah satu kunci di dokumen TOML; komentar di belakang nilai lama dipertahankan.
+pub fn set_key(doc: &mut toml_edit::DocumentMut, sec: &str, key: &str, v: toml_edit::Value) -> Result<(), String> {
+    let table = doc.entry(sec).or_insert(toml_edit::table());
+    let Some(table) = table.as_table_like_mut() else {
+        return Err(format!("[{sec}] di config.toml bukan tabel."));
+    };
+    match table.get_mut(key).and_then(|i| i.as_value_mut()) {
+        Some(old) => {
+            let decor = old.decor().clone();
+            *old = v;
+            *old.decor_mut() = decor;
+        }
+        None => {
+            table.insert(key, toml_edit::Item::Value(v));
+        }
+    }
+    Ok(())
+}
+
+/// Migrasi teks config lama. None = tidak ada yang perlu diubah.
+/// v2: ukuran notch bawaan lama (32 / 440 / 232) diganti ukuran baru yang lebih ringkas.
+fn migrate_text(text: &str) -> Option<String> {
+    let mut doc = text.parse::<toml_edit::DocumentMut>().ok()?;
+    let ver = doc.get("general").and_then(|g| g.get("config_version")).and_then(|v| v.as_integer()).unwrap_or(1);
+    if ver >= 3 {
+        return None;
+    }
+    if ver < 2 {
+        migrate_v2(&mut doc)?;
+    }
+    // v3: item "tray" ditambahkan di depan daftar kanan bar bila belum ada.
+    if let Some(arr) = doc.get_mut("bar").and_then(|b| b.get_mut("right")).and_then(|r| r.as_array_mut()) {
+        if !arr.iter().any(|v| v.as_str() == Some("tray")) {
+            arr.insert(0, "tray");
+            arr.fmt();
+        }
+    }
+    set_key(&mut doc, "general", "config_version", 3i64.into()).ok()?;
+    let out = doc.to_string();
+    validate(&out).ok()?;
+    Some(out)
+}
+
+/// v2: ukuran notch bawaan lama (32 / 440 / 232) diganti ukuran baru yang lebih ringkas.
+fn migrate_v2(doc: &mut toml_edit::DocumentMut) -> Option<()> {
+    let old: Vec<(&str, i64)> = [("compact_height", 32, 28), ("expanded_width", 440, 480), ("expanded_height", 232, 132)]
+        .into_iter()
+        .filter(|(k, was, _)| doc.get("notch").and_then(|t| t.get(k)).and_then(|v| v.as_integer()) == Some(*was))
+        .map(|(k, _, new)| (k, new))
+        .collect();
+    for (k, new) in old {
+        set_key(doc, "notch", k, new.into()).ok()?;
+    }
+    Some(())
+}
+
+fn migrate() {
+    if let Some(out) = std::fs::read_to_string(path()).ok().as_deref().and_then(migrate_text) {
+        let _ = std::fs::write(path(), out);
+    }
 }
 
 /// Buat file konfigurasi bawaan jika belum ada.
@@ -174,6 +253,7 @@ pub fn reload() -> Result<(), String> {
 
 pub fn init() {
     ensure_file();
+    migrate();
     let cfg = load().or_else(|_| {
         let v: toml::Value = toml::from_str(DEFAULT_TOML).unwrap();
         v.try_into::<Config>().map_err(|e| e.to_string())
@@ -225,6 +305,32 @@ mod tests {
     fn default_config_is_valid() {
         let v: toml::Value = toml::from_str(DEFAULT_TOML).expect("default toml parses");
         v.try_into::<Config>().expect("default deserializes into Config");
+    }
+
+    #[test]
+    fn migrates_old_notch_sizes_only_when_default() {
+        let old = "[general]
+language = \"id\"
+
+[notch]
+compact_height = 32   # tinggi
+expanded_width = 500
+expanded_height = 232
+";
+        let out = migrate_text(old).expect("perlu migrasi");
+        assert!(out.contains("compact_height = 28   # tinggi"), "{out}");
+        assert!(out.contains("expanded_width = 500"), "nilai buatan pengguna tidak disentuh: {out}");
+        assert!(out.contains("expanded_height = 132"));
+        assert!(out.contains("config_version = 3"));
+        assert!(migrate_text(&out).is_none(), "migrasi hanya sekali");
+    }
+
+    #[test]
+    fn migrates_tray_into_bar_right() {
+        let old = "[general]\nconfig_version = 2\n\n[bar]\nright = [\"wifi\", \"clock\"]  # kanan\n";
+        let out = migrate_text(old).expect("perlu migrasi");
+        assert!(out.contains("right = [\"tray\", \"wifi\", \"clock\"]  # kanan"), "{out}");
+        assert!(migrate_text(&out).is_none());
     }
 
     /// Menampilkan galat parse config pengguna yang sebenarnya (jika ada).

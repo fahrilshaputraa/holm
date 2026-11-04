@@ -26,6 +26,7 @@ pub enum Kind {
     Wifi,
     Bluetooth,
     Launcher,
+    Tray,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -37,6 +38,7 @@ enum Hit {
     VolMute,
     Uri(&'static str),
     AppRow(usize),
+    TrayIcon(u64),
     WifiToggle,
     WifiNet(usize),
     PwSubmit,
@@ -172,6 +174,49 @@ fn build(ui: &mut Ui, kind: Kind, w: f32, cal_off: i32, query: &str, sel: usize)
         Kind::Launcher => build_launcher(ui, w, query, sel),
         Kind::Wifi => build_wifi(ui, w),
         Kind::Bluetooth => build_bluetooth(ui, w),
+        Kind::Tray => build_tray(ui, w),
+    }
+}
+
+const TRAY_COLS: usize = 6;
+const TRAY_CELL: f32 = 40.0;
+
+/// Kotak ikon tray tersembunyi (seperti overflow taskbar), dengan tooltip ikon yang disorot.
+fn build_tray(ui: &mut Ui, w: f32) -> f32 {
+    let (s, pad) = (ui.s, 12.0 * ui.s);
+    let (_, items) = crate::tray::split();
+    let cell = TRAY_CELL * s;
+    let cols = items.len().clamp(1, TRAY_COLS);
+    let x0 = (w - cols as f32 * cell) / 2.0;
+    let mut tip = String::new();
+    for (i, v) in items.iter().enumerate() {
+        let r = (x0 + (i % cols) as f32 * cell, pad + (i / cols) as f32 * cell, cell, cell);
+        let hit = Hit::TrayIcon(v.id);
+        if ui.hovered(hit) {
+            ui.round((r.0 + 3.0 * s, r.1 + 3.0 * s, r.2 - 6.0 * s, r.3 - 6.0 * s), 9.0, 0x26FFFFFF);
+            tip = v.tip.lines().next().unwrap_or("").to_string();
+        }
+        if let (Some(c), Some(img)) = (ui.c, &v.image) {
+            let isz = 18.0 * s;
+            c.draw_image(img, r.0 + (cell - isz) / 2.0, r.1 + (cell - isz) / 2.0, isz, isz, 0.0, 1.0);
+        }
+        ui.hit(r, hit);
+    }
+    let rows = items.len().div_ceil(cols).max(1);
+    let mut y = pad + rows as f32 * cell;
+    if items.is_empty() {
+        ui.text("Tidak ada ikon tersembunyi", (pad, pad, w - 2.0 * pad, cell), 12.5, false, DIM, Align::Center);
+    }
+    // Baris tooltip: nama ikon yang disorot.
+    ui.text(if tip.is_empty() { "Klik kanan untuk menu aplikasi" } else { &tip }, (pad, y + 2.0 * s, w - 2.0 * pad, 18.0 * s), 11.5, false, if tip.is_empty() { 0xFF6E6E78 } else { WHITE }, Align::Center);
+    y += 24.0 * s;
+    y + pad - 6.0 * s
+}
+
+/// Daftar ikon tray berubah: segarkan popup bila sedang terbuka.
+pub fn on_tray_changed() {
+    if is_open(Kind::Tray) {
+        render();
     }
 }
 
@@ -586,6 +631,7 @@ fn render() {
         Kind::Volume => 300.0,
         Kind::Wifi | Kind::Bluetooth => 340.0,
         Kind::Launcher => 600.0,
+        Kind::Tray => (crate::tray::split().1.len().clamp(1, TRAY_COLS) as f32 * TRAY_CELL + 24.0).max(220.0),
     } * s;
     let accent = config::color(&cfg.general.accent);
     let mut ui = Ui { c: None, s, font: cfg.bar.font.clone(), accent, hover, rects: Vec::new() };
@@ -783,6 +829,14 @@ fn activate(h: Hit) {
             status::toggle_mute();
         }
         Hit::VolSlider => {}
+        Hit::TrayIcon(id) => {
+            hide();
+            let mut pt = POINT::default();
+            unsafe {
+                let _ = GetCursorPos(&mut pt);
+            }
+            crate::tray::click(id, false, false, (pt.x, pt.y));
+        }
         Hit::Uri(u) => {
             hide();
             let w: Vec<u16> = u.encode_utf16().chain(std::iter::once(0)).collect();
@@ -913,6 +967,18 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 if let Some(v) = slider_value(x) {
                     status::change_volume(v);
                 }
+            }
+            LRESULT(0)
+        }
+        WM_RBUTTONUP => {
+            let (x, y) = xy(lparam);
+            if let Some(Hit::TrayIcon(id)) = hit_at(x, y) {
+                hide();
+                let mut pt = POINT::default();
+                unsafe {
+                    let _ = GetCursorPos(&mut pt);
+                }
+                crate::tray::click(id, true, false, (pt.x, pt.y));
             }
             LRESULT(0)
         }

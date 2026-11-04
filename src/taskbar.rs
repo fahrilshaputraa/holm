@@ -24,7 +24,9 @@ fn taskbars() -> Vec<HWND> {
         if class == "Shell_TrayWnd" || class == "Shell_SecondaryTrayWnd" {
             let mut pid = 0u32;
             unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
-            if ctx.shell_pid == 0 || pid == ctx.shell_pid {
+            // Host tray HolmBar (tray.rs) juga ber-class Shell_TrayWnd: jangan pernah ikut disentuh.
+            let ours = pid == unsafe { windows::Win32::System::Threading::GetCurrentProcessId() };
+            if !ours && (ctx.shell_pid == 0 || pid == ctx.shell_pid) {
                 ctx.out.push(h);
             }
         }
@@ -42,6 +44,15 @@ fn taskbars() -> Vec<HWND> {
         let _ = EnumWindows(Some(cb), LPARAM(&mut ctx as *mut _ as isize));
     }
     ctx.out
+}
+
+/// `Shell_TrayWnd` milik Explorer (tujuan penerusan pesan tray/AppBar).
+pub fn shell_tray() -> Option<HWND> {
+    taskbars().into_iter().find(|h| {
+        let mut buf = [0u16; 32];
+        let n = unsafe { GetClassNameW(*h, &mut buf) };
+        String::from_utf16_lossy(&buf[..n.max(0) as usize]) == "Shell_TrayWnd"
+    })
 }
 
 /// Tebal taskbar bawaan Windows (px) bila menempel di tepi bawah monitor utama, selain itu 0.
