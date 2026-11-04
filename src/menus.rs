@@ -63,9 +63,9 @@ fn start_items() -> Vec<Item> {
         it("Restart...", "", Act::Confirm("Restart komputer sekarang? Pekerjaan yang belum disimpan bisa hilang.", "shutdown.exe", "/r /t 0")),
         it("Shut Down...", "", Act::Confirm("Matikan komputer sekarang? Pekerjaan yang belum disimpan bisa hilang.", "shutdown.exe", "/s /t 0")),
         SEP,
-        it("Open HormBar Config", "", Act::OpenConfig),
+        it("Open HolmBar Config", "", Act::OpenConfig),
         it("Reload Config", "", Act::ReloadConfig),
-        it("Quit HormBar", "", Act::QuitApp),
+        it("Quit HolmBar", "", Act::QuitApp),
     ]
 }
 
@@ -177,7 +177,7 @@ fn run(act: Act, owner: HWND, target: Option<HWND>) {
         Act::Launcher => crate::popup::open_launcher(),
         Act::Exec(f, a) => shell(f, a, SW_HIDE),
         Act::Confirm(q, f, a) => {
-            let (qq, cap) = (wide(q), wide("HormBar"));
+            let (qq, cap) = (wide(q), wide("HolmBar"));
             let r = unsafe { MessageBoxW(Some(owner), PCWSTR(qq.as_ptr()), PCWSTR(cap.as_ptr()), MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_TOPMOST | MB_SETFOREGROUND) };
             if r == IDYES {
                 shell(f, a, SW_HIDE);

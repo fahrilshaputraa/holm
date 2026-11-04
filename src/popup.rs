@@ -616,11 +616,11 @@ fn ensure_window() -> Option<HWND> {
     }
     unsafe {
         let hinst = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok()?;
-        let class: Vec<u16> = "HormPopupClass".encode_utf16().chain(std::iter::once(0)).collect();
+        let class: Vec<u16> = "HolmPopupClass".encode_utf16().chain(std::iter::once(0)).collect();
         let h = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             PCWSTR(class.as_ptr()),
-            windows::core::w!("HormBar Popup"),
+            windows::core::w!("HolmBar Popup"),
             WS_POPUP,
             0,
             0,

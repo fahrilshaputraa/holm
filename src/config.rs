@@ -100,7 +100,7 @@ pub fn current() -> Rc<Config> {
 
 pub fn dir() -> PathBuf {
     let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    base.join("HormBar")
+    base.join("HolmBar")
 }
 
 pub fn path() -> PathBuf {
@@ -116,8 +116,8 @@ pub fn ensure_file() {
     let p = path();
     if !p.exists() {
         let _ = std::fs::create_dir_all(dir());
-        // Pindahan dari nama lama (%APPDATA%\MacBar) bila ada.
-        let old = dir().with_file_name("MacBar").join("config.toml");
+        // Pindahan dari nama lama (%APPDATA%\HormBar) bila ada.
+        let old = dir().with_file_name("HormBar").join("config.toml");
         if std::fs::copy(&old, &p).is_err() {
             let _ = std::fs::write(&p, DEFAULT_TOML);
         }

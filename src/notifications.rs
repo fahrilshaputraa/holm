@@ -155,7 +155,7 @@ impl Scanner {
             for i in 0..kids.Length().unwrap_or(0) {
                 let Ok(win) = kids.GetElement(i) else { continue };
                 let class = bstr(win.CurrentClassName());
-                if matches!(class.as_str(), "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Progman" | "WorkerW" | "HormBarClass" | "HormNotchClass" | "HormDockClass" | "HormPopupClass") {
+                if matches!(class.as_str(), "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Progman" | "WorkerW" | "HolmBarClass" | "HolmNotchClass" | "HolmDockClass" | "HolmPopupClass") {
                     continue;
                 }
                 let img = self.image(win.CurrentProcessId().unwrap_or(0) as u32);

@@ -1,4 +1,4 @@
-# HormBar configuration
+# HolmBar configuration
 # File ini dibaca saat start dan dimuat ulang otomatis (maks. ~15 detik) setelah disimpan.
 # Anda cukup menulis nilai yang ingin diubah; sisanya memakai nilai bawaan.
 # Warna: "#RRGGBB" atau "#AARRGGBB".

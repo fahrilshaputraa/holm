@@ -129,7 +129,7 @@ fn eligible(hwnd: HWND) -> bool {
         if cloaked != 0 {
             return false;
         }
-        !matches!(class_name(hwnd).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "HormBarClass" | "HormNotchClass" | "HormDockClass")
+        !matches!(class_name(hwnd).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "HolmBarClass" | "HolmNotchClass" | "HolmDockClass")
     }
 }
 

@@ -87,7 +87,7 @@ fn clean_title(t: &str) -> String {
 fn http_get(path: &str) -> Option<(u32, Vec<u8>)> {
     let w = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
     unsafe {
-        let agent = w("HormBar/0.1");
+        let agent = w("HolmBar/0.1");
         let session = WinHttpOpen(PCWSTR(agent.as_ptr()), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, PCWSTR::null(), PCWSTR::null(), 0);
         if session.is_null() {
             return None;

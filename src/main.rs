@@ -76,7 +76,7 @@ pub fn show_menu(owner: HWND) {
         let _ = AppendMenuW(menu, MF_STRING, IDM_RELOAD, w!("Reload config"));
         let _ = AppendMenuW(menu, MF_STRING, IDM_PREVIEW_NOTIF, w!("Preview notification"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT, w!("Quit HormBar"));
+        let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT, w!("Quit HolmBar"));
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let _ = SetForegroundWindow(owner);
@@ -161,7 +161,7 @@ fn rebuild() {
     let mut new_bars = Vec::new();
     if cfg.bar.enabled {
         for mon in monitors::selected(&cfg.bar.monitors) {
-            if let Some(h) = create("HormBarClass", w!("HormBar")) {
+            if let Some(h) = create("HolmBarClass", w!("HolmBar")) {
                 bar::attach(h, mon);
                 unsafe {
                     let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
@@ -174,7 +174,7 @@ fn rebuild() {
     let mut new_notches = Vec::new();
     if cfg.notch.enabled {
         for mon in monitors::selected(&cfg.notch.monitors) {
-            if let Some(h) = create("HormNotchClass", w!("HormBar Notch")) {
+            if let Some(h) = create("HolmNotchClass", w!("HolmBar Notch")) {
                 notch::attach(h, mon);
                 unsafe {
                     let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
@@ -186,7 +186,7 @@ fn rebuild() {
     let mut new_docks = Vec::new();
     if cfg.dock.enabled {
         for mon in monitors::selected(&cfg.dock.monitors) {
-            if let Some(h) = create("HormDockClass", w!("HormBar Dock")) {
+            if let Some(h) = create("HolmDockClass", w!("HolmBar Dock")) {
                 dock::attach(h, mon);
                 unsafe {
                     let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
@@ -340,7 +340,7 @@ unsafe extern "system" fn bar_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 IDM_RELOAD => reload_config(),
                 IDM_PREVIEW_NOTIF => {
                     let t = notifications::Toast {
-                        app: "HormBar".into(),
+                        app: "HolmBar".into(),
                         title: "Contoh notifikasi".into(),
                         body: "Begini tampilan banner Windows di notch.".into(),
                         icon: None,
@@ -367,10 +367,10 @@ fn register_classes() {
     unsafe {
         let hinst: HINSTANCE = GetModuleHandleW(None).unwrap().into();
         let cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
-        let class_bar = wide("HormBarClass");
-        let class_notch = wide("HormNotchClass");
-        let class_dock = wide("HormDockClass");
-        let class_popup = wide("HormPopupClass");
+        let class_bar = wide("HolmBarClass");
+        let class_notch = wide("HolmNotchClass");
+        let class_dock = wide("HolmDockClass");
+        let class_popup = wide("HolmPopupClass");
         for (name, proc) in [
             (&class_popup, Some(popup::wndproc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT)),
             (&class_dock, Some(dock::wndproc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT)),
@@ -422,7 +422,7 @@ fn handle_thread_message(msg: &MSG) {
 fn main() {
     unsafe {
         // Satu instance saja.
-        let _guard = CreateMutexW(None, false, w!("Local\\HormBarSingleton"));
+        let _guard = CreateMutexW(None, false, w!("Local\\HolmBarSingleton"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return;
         }
