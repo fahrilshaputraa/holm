@@ -1,0 +1,72 @@
+# HormBar configuration
+# File ini dibaca saat start dan dimuat ulang otomatis (maks. ~15 detik) setelah disimpan.
+# Anda cukup menulis nilai yang ingin diubah; sisanya memakai nilai bawaan.
+# Warna: "#RRGGBB" atau "#AARRGGBB".
+
+[general]
+language = "id"            # "id" | "en"  (nama hari & bulan pada jam)
+accent = "#0A84FF"          # warna sorotan popup (kalender, slider, pilihan)
+
+[bar]
+enabled = true
+monitors = "all"             # "all" | "primary"
+height = 32
+background = "#18181B"
+opacity = 0.90
+text = "#FFFFFF"
+dim_text = "#E2E2E6"
+font = "Segoe UI Variable Display"
+icon_font = "JetBrainsMono NFP"   # Nerd Font; fallback ke Segoe UI Symbol
+font_size = 12.5
+logo = ""
+desktop_label = "Finder"           # nama yang tampil saat explorer.exe aktif
+menus = ["File", "Edit", "View", "Window", "Help"]
+# Urutan kiri -> kanan. Pilihan: wifi, volume, bluetooth, battery, control_center, clock
+right = ["bluetooth", "wifi", "volume", "battery", "control_center", "clock"]
+# Token: %a %A %d %b %B %m %Y %y %H %M
+clock_format = "%a %d %b  %H:%M"
+
+[notch]
+enabled = true
+monitors = "all"             # "all" | "primary"
+background = "#000000"
+accent = "#1DB954"
+compact_width = 210
+compact_height = 32
+expanded_width = 440
+expanded_height = 232
+expand_on_hover = true
+close_delay_ms = 400
+animation_ms = 180
+
+[lyrics]
+# Mengambil lirik dari lrclib.net (hanya judul, artis, dan durasi lagu yang dikirim).
+enabled = true
+
+[dock]
+# Dock ala macOS yang menggantikan taskbar Windows (taskbar asli disembunyikan, bukan diubah setting-nya,
+# dan dipulihkan saat aplikasi keluar). Fungsi tray/jam/Start ada di menu bar atas.
+enabled = true
+monitors = "primary"           # "all" | "primary"
+icon_size = 48
+magnification = 1.7          # 1.0 = tanpa pembesaran
+background = "#1C1C20"
+opacity = 0.55
+reserve_space = true          # sisihkan ruang agar jendela maksimal tidak menutupi dock
+replace_taskbar = true         # true = sembunyikan taskbar Windows & Dock menggantikannya (dipulihkan saat keluar)
+# Aplikasi yang selalu tampil (path .exe; boleh memakai %VAR%).
+pinned = ["%SystemRoot%\\explorer.exe"]
+start_button = true            # tombol Windows di ujung kiri Dock (klik = cari aplikasi, klik kanan = menu daya)
+import_taskbar_pins = true     # ikut menyematkan aplikasi yang di-pin di taskbar Windows
+
+[notifications]
+# Notch menampilkan banner notifikasi Windows (membaca banner yang sedang tampil lewat UI Automation;
+# riwayat notifikasi dan banner yang disenyapkan Do Not Disturb tidak terbaca). Teks tidak disimpan ke disk.
+enabled = true
+duration_ms = 5000
+show_body = true        # false = hanya tampilkan aplikasi + judul
+poll_ms = 2000          # pemindaian cadangan bila event terlewat (0 = hanya event; lebih hemat baterai)
+
+[launcher]
+# Pintasan global untuk pencarian aplikasi (kosong = nonaktif). Contoh: "ctrl+shift+f12". Alt+Space, Ctrl+Alt+Space, Win+Alt+Space umumnya sudah dipakai PowerToys/Claude.
+hotkey = ""
