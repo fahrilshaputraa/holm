@@ -21,6 +21,15 @@ pub enum Icon {
     ChevronRight,
     ChevronDown,
     ChevronUp,
+    Wifi,
+    Bluetooth,
+    Airplane,
+    Moon,
+    /// Speaker dengan tingkat 0 (mute, tanda silang) sampai 3 gelombang.
+    Speaker(u8),
+    Sun,
+    /// Dua sakelar: ikon Control Center di menu bar.
+    Toggles,
     Monitor,
     Apps,
     Bell,
@@ -150,6 +159,57 @@ pub fn draw(c: &Canvas, icon: Icon, r: (f32, f32, f32, f32), col: u32, bg: u32) 
         }
         Icon::ChevronLeft => p.poly(&[(15.5, 3.5), (18.0, 6.0), (12.0, 12.0), (18.0, 18.0), (15.5, 20.5), (7.0, 12.0)], col),
         Icon::ChevronRight => p.poly(&[(8.5, 3.5), (6.0, 6.0), (12.0, 12.0), (6.0, 18.0), (8.5, 20.5), (17.0, 12.0)], col),
+        Icon::Wifi => {
+            let (cx, cy) = p.pt(12.0, 19.0);
+            c.fill_ellipse(cx - 2.0 * p.u, cy - 2.0 * p.u, 4.0 * p.u, 4.0 * p.u, col);
+            for r in [6.0f32, 11.0, 16.0] {
+                c.stroke_arc(cx, cy, r * p.u, -135.0, 90.0, 2.6 * p.u, col);
+            }
+        }
+        Icon::Bluetooth => {
+            let w = 2.3;
+            p.bar(12.0, 2.5, 12.0, 21.5, w, col);
+            p.bar(12.0, 2.5, 18.0, 8.0, w, col);
+            p.bar(18.0, 8.0, 6.5, 17.0, w, col);
+            p.bar(12.0, 21.5, 18.0, 16.0, w, col);
+            p.bar(18.0, 16.0, 6.5, 7.0, w, col);
+        }
+        Icon::Airplane => {
+            p.bar(12.0, 2.8, 12.0, 20.5, 3.2, col);
+            p.poly(&[(12.0, 9.0), (21.5, 14.5), (21.5, 16.8), (12.0, 13.8), (2.5, 16.8), (2.5, 14.5)], col);
+            p.poly(&[(12.0, 18.0), (16.5, 21.2), (16.5, 22.4), (12.0, 21.0), (7.5, 22.4), (7.5, 21.2)], col);
+        }
+        Icon::Moon => {
+            p.circle(11.5, 12.5, 9.0, col);
+            p.circle(16.8, 8.2, 7.6, bg);
+        }
+        Icon::Speaker(level) => {
+            p.poly(&[(3.0, 9.0), (7.5, 9.0), (13.0, 4.0), (13.0, 20.0), (7.5, 15.0), (3.0, 15.0)], col);
+            if level == 0 {
+                p.bar(16.2, 9.2, 21.2, 14.8, 2.0, col);
+                p.bar(21.2, 9.2, 16.2, 14.8, 2.0, col);
+            } else {
+                let (cx, cy) = p.pt(13.0, 12.0);
+                for (i, r) in [4.5f32, 8.0, 11.5].iter().take(level.min(3) as usize).enumerate() {
+                    let _ = i;
+                    c.stroke_arc(cx, cy, r * p.u, -40.0, 80.0, 2.2 * p.u, col);
+                }
+            }
+        }
+        Icon::Sun => {
+            p.circle(12.0, 12.0, 4.6, col);
+            for k in 0..8 {
+                let a = k as f32 * std::f32::consts::PI / 4.0;
+                let (ca, sa) = (a.cos(), a.sin());
+                p.bar(12.0 + ca * 7.6, 12.0 + sa * 7.6, 12.0 + ca * 10.4, 12.0 + sa * 10.4, 2.0, col);
+            }
+        }
+        Icon::Toggles => {
+            p.rect(2.5, 3.5, 19.0, 7.5, 3.75, col);
+            p.circle(17.5, 7.25, 2.6, bg);
+            p.rect(2.5, 13.0, 19.0, 7.5, 3.75, col);
+            p.circle(6.5, 16.75, 2.6, bg);
+        }
         Icon::ChevronUp => p.poly(&[(3.5, 15.5), (6.0, 18.0), (12.0, 12.0), (18.0, 18.0), (20.5, 15.5), (12.0, 7.0)], col),
         Icon::ChevronDown => p.poly(&[(3.5, 8.5), (6.0, 6.0), (12.0, 12.0), (18.0, 6.0), (20.5, 8.5), (12.0, 17.0)], col),
         Icon::Monitor => {

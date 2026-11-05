@@ -78,6 +78,32 @@ impl Image {
 }
 
 impl Image {
+    /// Salinan persegi (dipangkas di tengah) berukuran `px`, diperkecil sekali dengan kualitas tinggi.
+    /// Dipakai agar gambar per-frame cukup memakai interpolasi cepat dari bitmap kecil.
+    pub fn resized(&self, px: i32) -> Option<Image> {
+        unsafe {
+            let (mut iw, mut ih) = (0u32, 0u32);
+            GdipGetImageWidth(self.bmp as *mut GpImage, &mut iw);
+            GdipGetImageHeight(self.bmp as *mut GpImage, &mut ih);
+            if iw == 0 || ih == 0 || px <= 0 {
+                return None;
+            }
+            let mut dst: *mut GpBitmap = null_mut();
+            if GdipCreateBitmapFromScan0(px, px, 0, 0x000E_200B, None, &mut dst).0 != 0 || dst.is_null() {
+                return None;
+            }
+            let mut g: *mut GpGraphics = null_mut();
+            GdipGetImageGraphicsContext(dst as *mut GpImage, &mut g);
+            GdipSetInterpolationMode(g, InterpolationModeHighQualityBicubic);
+            GdipSetPixelOffsetMode(g, PixelOffsetModeHalf);
+            let side = iw.min(ih) as i32;
+            let (sx, sy) = ((iw as i32 - side) / 2, (ih as i32 - side) / 2);
+            GdipDrawImageRectRectI(g, self.bmp as *mut GpImage, 0, 0, px, px, sx, sy, side, side, UnitPixel, std::ptr::null(), 0, null_mut());
+            GdipDeleteGraphics(g);
+            Some(Image { bmp: dst, _stream: None })
+        }
+    }
+
     /// Ikon yang hampir seluruhnya gelap (dibuat untuk taskbar terang) diubah menjadi siluet putih
     /// agar terbaca di bar gelap; ikon berwarna dibiarkan. Mengembalikan true bila diubah.
     pub fn lighten_if_dark(&self) -> bool {
@@ -248,7 +274,7 @@ impl Canvas {
             let mut gfx: *mut GpGraphics = null_mut();
             GdipGetImageGraphicsContext(bitmap as *mut GpImage, &mut gfx);
             GdipSetSmoothingMode(gfx, SmoothingModeAntiAlias);
-            GdipSetTextRenderingHint(gfx, TextRenderingHintAntiAliasGridFit);
+            GdipSetTextRenderingHint(gfx, TextRenderingHintAntiAlias); // tanpa grid-fit: jarak huruf benar di DPI pecahan
 
             Some(Canvas { hdc_screen, hdc_mem, hbmp, old, bitmap, gfx, w, h })
         }
@@ -332,6 +358,22 @@ impl Canvas {
             GdipSetPenEndCap(pen, LineCapRound);
             GdipDrawArc(self.gfx, pen, cx - r, cy - r, 2.0 * r, 2.0 * r, start, sweep);
             GdipDeletePen(pen);
+        }
+    }
+
+    /// Hapus seluruh kanvas menjadi transparan (kanvas dipakai ulang antar frame).
+    pub fn clear(&self) {
+        unsafe {
+            GdipGraphicsClear(self.gfx, 0);
+        }
+    }
+
+    /// Gambar bitmap kecil yang sudah dipangkas persegi tanpa clip: jalur cepat untuk animasi.
+    pub fn draw_image_fast(&self, img: &Image, x: f32, y: f32, w: f32, h: f32) {
+        unsafe {
+            GdipSetInterpolationMode(self.gfx, InterpolationModeHighQualityBilinear);
+            GdipSetPixelOffsetMode(self.gfx, PixelOffsetModeHalf);
+            GdipDrawImageRect(self.gfx, img.bmp as *mut GpImage, x, y, w, h);
         }
     }
 

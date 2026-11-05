@@ -1,8 +1,12 @@
-//! Notifikasi Windows di notch. Banner toast yang sedang tampil dibaca lewat UI Automation
-//! (bukan API riwayat notifikasi, jadi tidak butuh izin khusus): aplikasi, judul, isi, dan gambar
-//! pada banner (avatar/logo) disalin dari layar. Riwayat dan banner yang disenyapkan DND tidak terbaca.
-//! Pemicu: event WindowOpened UIA + event jendela dari main (kick) + pemindaian cadangan berkala.
-//! Teks hanya hidup di memori. Klik kartu = Invoke banner aslinya, atau Win+N bila banner sudah hilang.
+//! Notifikasi Windows di notch.
+//!
+//! Banner dideteksi REALTIME lewat UI Automation (teks banner; Windows baru memasukkan toast ke daftar
+//! notifikasi setelah bannernya selesai, ±8 dtk kemudian, jadi daftar itu terlalu lambat sebagai sumber).
+//! Logo asli aplikasi pengirim diambil dari `UserNotificationListener` (API resmi): pembaca latar
+//! menyimpan peta nama aplikasi -> logo dari daftar notifikasi, dan banner baru memakainya. Bila tidak ada,
+//! jatuh ke gambar banner yang disalin dari layar, lalu ikon Start Menu (notch.rs), lalu monogram.
+//! Listener tidak pernah menampilkan notifikasi sendiri, jadi Jangan Ganggu tetap dihormati.
+//! Klik kartu = Invoke banner aslinya, atau Win+N bila banner sudah hilang. Teks hanya hidup di memori.
 
 use std::collections::HashMap;
 use std::sync::{Condvar, Mutex};
@@ -53,8 +57,86 @@ pub fn activate() {
     }
 }
 
+/// Peta nama aplikasi (huruf kecil) -> logo asli dari UserNotificationListener (None = aplikasi tanpa logo).
+static LOGOS: Mutex<Option<HashMap<String, Option<Vec<u8>>>>> = Mutex::new(None);
+
+fn logo_for(app: &str) -> Option<Vec<u8>> {
+    let key = app.trim().to_lowercase();
+    if key.is_empty() {
+        return None;
+    }
+    LOGOS.lock().ok()?.as_ref()?.get(&key).cloned().flatten()
+}
+
 pub fn start(main_tid: u32, poll_ms: u32) {
     std::thread::spawn(move || unsafe { worker(main_tid, poll_ms) });
+    std::thread::spawn(logo_worker);
+}
+
+/// Log diagnostik ke notif-debug.txt bila HOLM_DEBUG diset.
+fn dbg(msg: &str) {
+    if std::env::var_os("HOLM_DEBUG").is_some() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(crate::config::dir().join("notif-debug.txt")) {
+            let _ = writeln!(f, "{msg}");
+        }
+    }
+}
+
+fn clean(s: &str) -> String {
+    s.replace(['\u{200e}', '\u{200f}'], "").split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Baca isi stream (logo) menjadi byte gambar.
+fn read_ref(r: windows::Storage::Streams::RandomAccessStreamReference) -> Option<Vec<u8>> {
+    use windows::Storage::Streams::DataReader;
+    let stream = r.OpenReadAsync().ok()?.join().ok()?;
+    let size = stream.Size().ok()? as u32;
+    if size == 0 || size > 4_000_000 {
+        return None;
+    }
+    let reader = DataReader::CreateDataReader(&stream).ok()?;
+    reader.LoadAsync(size).ok()?.join().ok()?;
+    let mut buf = vec![0u8; size as usize];
+    reader.ReadBytes(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// Latar: kumpulkan logo asli tiap aplikasi dari daftar notifikasi Windows (izin diminta sekali).
+fn logo_worker() {
+    use windows::UI::Notifications::Management::{UserNotificationListener, UserNotificationListenerAccessStatus};
+    use windows::UI::Notifications::NotificationKinds;
+    use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
+    unsafe {
+        let _ = RoInitialize(RO_INIT_MULTITHREADED);
+    }
+    let Ok(l) = UserNotificationListener::Current() else { return };
+    let access = l.RequestAccessAsync().and_then(|o| o.join());
+    dbg(&format!("logo: akses listener = {access:?}"));
+    if !matches!(access, Ok(UserNotificationListenerAccessStatus::Allowed)) {
+        return; // tanpa izin: jatuh ke gambar banner / ikon Start Menu
+    }
+    if let Ok(mut g) = LOGOS.lock() {
+        g.get_or_insert_with(HashMap::new);
+    }
+    loop {
+        if let Ok(list) = l.GetNotificationsAsync(NotificationKinds::Toast).and_then(|o| o.join()) {
+            for n in list {
+                let Some(disp) = n.AppInfo().ok().and_then(|a| a.DisplayInfo().ok()) else { continue };
+                let Some(name) = disp.DisplayName().ok().map(|s| clean(&s.to_string()).to_lowercase()) else { continue };
+                let known = LOGOS.lock().ok().and_then(|g| g.as_ref().map(|m| m.contains_key(&name))).unwrap_or(false);
+                if known || name.is_empty() {
+                    continue;
+                }
+                let logo = disp.GetLogo(windows::Foundation::Size { Width: 64.0, Height: 64.0 }).ok().and_then(read_ref);
+                dbg(&format!("logo: '{name}' -> {}", if logo.is_some() { "ada" } else { "tidak ada" }));
+                if let Ok(mut g) = LOGOS.lock() {
+                    g.get_or_insert_with(HashMap::new).insert(name, logo);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    }
 }
 
 #[implement(IUIAutomationEventHandler)]
@@ -237,10 +319,13 @@ impl Scanner {
             self.last = Some(toast.clone());
 
             // Tunggu animasi geser selesai agar gambar tidak terpotong, lalu salin pikselnya.
-            let icon = image.and_then(|im| {
-                std::thread::sleep(Duration::from_millis(450));
-                capture(im.CurrentBoundingRectangle().ok()?)
+            let icon = logo_for(&app).or_else(|| {
+                image.and_then(|im| {
+                    std::thread::sleep(Duration::from_millis(450));
+                    capture(im.CurrentBoundingRectangle().ok()?)
+                })
             });
+            dbg(&format!("banner: app='{app}' judul='{title}' logo_asli={}", logo_for(&app).is_some()));
             let t = Box::new(Toast { app, title, body, icon });
             let _ = PostThreadMessageW(self.main_tid, WM_NOTIFY_TOAST, WPARAM(0), LPARAM(Box::into_raw(t) as isize));
         }
@@ -316,5 +401,40 @@ unsafe fn capture(r: RECT) -> Option<Vec<u8>> {
         let _ = DeleteDC(dc);
         ReleaseDC(None, screen);
         out
+    }
+}
+
+#[cfg(test)]
+mod probe {
+    /// Uji eksplorasi (manual): apakah UserNotificationListener boleh dipakai aplikasi desktop ini?
+    #[test]
+    #[ignore]
+    fn listener_access_and_contents() {
+        use windows::UI::Notifications::Management::*;
+        use windows::UI::Notifications::*;
+        use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
+        unsafe {
+            let _ = RoInitialize(RO_INIT_MULTITHREADED);
+        }
+        let l = UserNotificationListener::Current().expect("listener");
+        println!("status awal: {:?}", l.GetAccessStatus());
+        let r = l.RequestAccessAsync().and_then(|o| o.join());
+        println!("RequestAccess: {:?}", r);
+        if let Ok(UserNotificationListenerAccessStatus::Allowed) = r {
+            let list = l.GetNotificationsAsync(NotificationKinds::Toast).and_then(|o| o.join()).expect("get");
+            println!("jumlah notifikasi di pusat notifikasi: {}", list.Size().unwrap_or(0));
+            for n in list {
+                let app = n.AppInfo().and_then(|a| a.DisplayInfo()).and_then(|d| d.DisplayName()).map(|s| s.to_string()).unwrap_or_default();
+                let texts: Vec<String> = n
+                    .Notification()
+                    .and_then(|x| x.Visual())
+                    .and_then(|v| v.GetBinding(&KnownNotificationBindings::ToastGeneric().unwrap()))
+                    .and_then(|b| b.GetTextElements())
+                    .map(|t| t.into_iter().filter_map(|e| e.Text().ok().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                let logo = n.AppInfo().and_then(|a| a.DisplayInfo()).and_then(|d| d.GetLogo(windows::Foundation::Size { Width: 64.0, Height: 64.0 })).is_ok();
+                println!("- app='{app}' logo={logo} teks={texts:?}");
+            }
+        }
     }
 }

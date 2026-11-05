@@ -204,6 +204,39 @@ const SECTIONS: &[Section] = &[
         footer: "Urutan item (pertama = paling luar) bisa diubah di config.toml: notch.compact_left / compact_right.",
     },
     Section {
+        title: "Control Center",
+        icon: Icon::Toggles,
+        tint: 0xFF5E5CE6,
+        groups: &[
+            Group {
+                title: "Tampil di Control Center",
+                fields: &[
+                    f("control", "modules", "Wi-Fi", "", Kind::Member("wifi")),
+                    f("control", "modules", "Bluetooth", "", Kind::Member("bluetooth")),
+                    f("control", "modules", "Mode Pesawat", "Mematikan/menyalakan Wi-Fi dan Bluetooth", Kind::Member("airplane")),
+                    f("control", "modules", "Jangan Ganggu", "Mematikan banner notifikasi aplikasi Windows", Kind::Member("dnd")),
+                    f("control", "modules", "Proyeksi", "Sambungkan ke layar nirkabel", Kind::Member("cast")),
+                    f("control", "modules", "Layar", "Slider kecerahan (hanya layar internal)", Kind::Member("display")),
+                    f("control", "modules", "Suara", "", Kind::Member("sound")),
+                    f("control", "modules", "Sedang Diputar", "Kontrol media", Kind::Member("media")),
+                ],
+            },
+            Group {
+                title: "Tampil di menu bar",
+                fields: &[
+                    f("bar", "right", "Control Center", "Ikon untuk membuka panel ini", Kind::Member("control_center")),
+                    f("bar", "right", "Ikon tray aplikasi", "Discord, OneDrive, dll.", Kind::Member("tray")),
+                    f("bar", "right", "Wi-Fi", "", Kind::Member("wifi")),
+                    f("bar", "right", "Bluetooth", "", Kind::Member("bluetooth")),
+                    f("bar", "right", "Suara", "", Kind::Member("volume")),
+                    f("bar", "right", "Baterai", "", Kind::Member("battery")),
+                    f("bar", "right", "Jam", "Klik untuk kalender", Kind::Member("clock")),
+                ],
+            },
+        ],
+        footer: "Wi-Fi, Bluetooth, dan Suara tetap bisa diakses dari Control Center walau ikonnya disembunyikan di bar.",
+    },
+    Section {
         title: "Dock",
         icon: Icon::Apps,
         tint: 0xFFBF5AF2,
@@ -213,8 +246,11 @@ const SECTIONS: &[Section] = &[
                 fields: &[
                     f("dock", "enabled", "Tampilkan Dock", "", Kind::Toggle),
                     f("dock", "replace_taskbar", "Gantikan taskbar Windows", "Taskbar dipulihkan saat HolmBar ditutup", Kind::Toggle),
+                    f("dock", "reclaim_space", "Jendela memakai layar penuh", "Melepas ruang taskbar yang disembunyikan (auto-hide Windows dipulihkan saat keluar)", Kind::Toggle),
                     f("dock", "monitors", "Monitor", "", MONITORS),
-                    f("dock", "reserve_space", "Sisihkan ruang layar", "Jendela maksimal tidak menutupi Dock", Kind::Toggle),
+                    f("dock", "autohide", "Sembunyikan otomatis", "Pintar = sembunyi saat ada jendela menutupi; arahkan kursor ke tepi bawah untuk memunculkan", Kind::Choice(&[("off", "Mati"), ("smart", "Pintar"), ("always", "Selalu")])),
+                    f("dock", "autohide_delay_ms", "Jeda sebelum sembunyi", "", int(0.0, 2000.0, 50.0, "ms")),
+                    f("dock", "reserve_space", "Sisihkan ruang layar", "Hanya berlaku bila sembunyi otomatis mati", Kind::Toggle),
                 ],
             },
             Group {
@@ -553,7 +589,11 @@ fn member_arrays(current: &toml::Value, values: &[Option<toml::Value>]) -> Vec<(
             let mut out: Vec<String> = old.iter().filter(|i| on(i).unwrap_or(true)).cloned().collect();
             for (i, b) in &t {
                 if *b && !out.iter().any(|o| o.eq_ignore_ascii_case(i)) {
-                    out.push(i.to_string());
+                    // Item bar baru masuk sebelum jam (jam tetap paling kanan).
+                    match out.iter().position(|o| (sec, key) == ("bar", "right") && o == "clock") {
+                        Some(p) => out.insert(p, i.to_string()),
+                        None => out.push(i.to_string()),
+                    }
                 }
             }
             (sec, key, out)
@@ -1404,11 +1444,27 @@ mod tests {
         let arrays = member_arrays(&current, &values);
         let tabs = arrays.iter().find(|(_, k, _)| *k == "tabs").unwrap();
         assert_eq!(tabs.2, vec!["timer".to_string(), "system".to_string()], "media dimatikan, system ditambah di belakang");
-        assert!(arrays.iter().all(|(_, k, _)| *k == "tabs"), "hanya array Member");
         let cur: toml::Value = toml::from_str("[notch]\ncompact_left = [\"artwork\"]\ncompact_right = [\"timer\", \"visualizer\"]\n").unwrap();
         let slots = slot_arrays(&cur, &values);
         assert_eq!(slots[0].2, vec!["clock".to_string()], "artwork pindah ke kanan, clock ditambah di kiri");
         assert_eq!(slots[1].2, vec!["visualizer".to_string(), "artwork".to_string()], "timer dimatikan");
+    }
+
+    #[test]
+    fn bar_items_insert_before_clock() {
+        let current: toml::Value = toml::from_str("[bar]
+right = [\"wifi\", \"clock\"]
+").unwrap();
+        let values: Vec<Option<toml::Value>> = all_fields()
+            .iter()
+            .map(|(_, f)| match f.kind {
+                Kind::Member(i) => Some(toml::Value::Boolean(f.sec == "bar" && matches!(i, "wifi" | "clock" | "control_center"))),
+                _ => None,
+            })
+            .collect();
+        let arrays = member_arrays(&current, &values);
+        let right = arrays.iter().find(|(s, k, _)| (*s, *k) == ("bar", "right")).unwrap();
+        assert_eq!(right.2, vec!["wifi".to_string(), "control_center".to_string(), "clock".to_string()]);
     }
 
     #[test]

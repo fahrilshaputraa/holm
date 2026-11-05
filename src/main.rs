@@ -3,10 +3,12 @@
 mod bar;
 mod canvas;
 mod config;
+mod control;
 mod dock;
 mod icons;
 mod lyrics;
 mod media;
+mod menu;
 mod menus;
 mod monitors;
 mod notch;
@@ -49,6 +51,8 @@ const IPC_CLASS: PCWSTR = w!("HolmBarIpcClass");
 
 static MAIN_TID: AtomicU32 = AtomicU32::new(0);
 static REBUILD_PENDING: AtomicBool = AtomicBool::new(false);
+/// Ada aplikasi layar penuh: bar/notch/Dock turun ke dasar dan tidak boleh dirampas kembali.
+pub static FULLSCREEN: AtomicBool = AtomicBool::new(false);
 static QUITTING: AtomicBool = AtomicBool::new(false);
 static REBUILDING: AtomicBool = AtomicBool::new(false);
 static NOTIF_STARTED: AtomicBool = AtomicBool::new(false);
@@ -77,25 +81,21 @@ fn notches() -> Vec<HWND> {
     WINDOWS.with(|w| w.borrow().notches.clone())
 }
 
-pub fn show_menu(owner: HWND) {
+/// Menu klik kanan HolmBar (bar, Dock, notch); digambar sendiri, bukan menu Win32.
+pub fn show_menu(_owner: HWND) {
+    let mut pt = POINT::default();
     unsafe {
-        let Ok(menu) = CreatePopupMenu() else { return };
-        let _ = AppendMenuW(menu, MF_STRING, IDM_SETTINGS, w!("Settings..."));
-        let _ = AppendMenuW(menu, MF_STRING, IDM_OPEN_CONFIG, w!("Open config file"));
-        let _ = AppendMenuW(menu, MF_STRING, IDM_RELOAD, w!("Reload config"));
-        let _ = AppendMenuW(menu, MF_STRING, IDM_PREVIEW_NOTIF, w!("Preview notification"));
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT, w!("Quit HolmBar"));
-        let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
-        let _ = SetForegroundWindow(owner);
-        // TPM_RETURNCMD: menu juga dipanggil dari Dock/notch yang tidak menangani WM_COMMAND.
-        let cmd = TrackPopupMenuEx(menu, (TPM_RIGHTBUTTON | TPM_RETURNCMD).0, pt.x, pt.y, owner, None).0;
-        let _ = DestroyMenu(menu);
-        if cmd > 0 {
-            handle_command(cmd as usize);
-        }
     }
+    let items = vec![
+        menu::MenuItem::new("Settings...", "", IDM_SETTINGS),
+        menu::MenuItem::new("Open config file", "", IDM_OPEN_CONFIG),
+        menu::MenuItem::new("Reload config", "", IDM_RELOAD),
+        menu::MenuItem::new("Preview notification", "", IDM_PREVIEW_NOTIF),
+        menu::MenuItem::sep(),
+        menu::MenuItem::new("Quit HolmBar", "", IDM_EXIT),
+    ];
+    menu::show(items, pt.x, pt.y, handle_command);
 }
 
 /// Perintah menu HolmBar (dari menu klik kanan atau menu logo Windows).
@@ -131,6 +131,11 @@ pub(crate) fn open_config() {
     unsafe {
         ShellExecuteW(None, w!("open"), PCWSTR(e.as_ptr()), PCWSTR(a.as_ptr()), PCWSTR::null(), SW_SHOWNORMAL);
     }
+}
+
+pub fn set_fullscreen(on: bool) {
+    FULLSCREEN.store(on, Ordering::SeqCst);
+    set_z(if on { HWND_BOTTOM } else { HWND_TOPMOST });
 }
 
 pub fn set_z(z: HWND) {
@@ -240,14 +245,15 @@ fn rebuild() {
     for h in &new_notches {
         notch::redraw(*h);
     }
-    dock::reset_pins();
-    dock::refresh(&new_docks, None);
-    raise_notches();
     if cfg.dock.enabled && cfg.dock.replace_taskbar {
         taskbar::hide();
+        taskbar::reclaim_space(cfg.dock.reclaim_space);
     } else {
         taskbar::restore();
     }
+    dock::reset_pins();
+    dock::refresh(&new_docks, None);
+    raise_notches();
     REBUILDING.store(false, Ordering::SeqCst);
 }
 
@@ -315,6 +321,10 @@ unsafe extern "system" fn dock_hook(_h: HWINEVENTHOOK, _ev: u32, hwnd: HWND, id_
     let mut cls = [0u16; 64];
     let n = unsafe { GetClassNameW(hwnd, &mut cls) }.max(0) as usize;
     let cls = String::from_utf16_lossy(&cls[..n]);
+    // Taskbar Windows (auto-hide) dimunculkan Explorer saat kursor di tepi bawah: sembunyikan seketika.
+    if (cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd") && taskbar::autohid() {
+        taskbar::enforce();
+    }
     if cls.contains("CoreWindow") || cls.contains("Xaml") || cls.contains("Toast") || cls.contains("Notification") {
         notifications::kick();
     }
@@ -344,7 +354,7 @@ unsafe extern "system" fn bar_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         }
         bar::WM_APPBAR => {
             match wparam.0 as u32 {
-                ABN_FULLSCREENAPP => set_z(if lparam.0 != 0 { HWND_BOTTOM } else { HWND_TOPMOST }),
+                ABN_FULLSCREENAPP => set_fullscreen(lparam.0 != 0),
                 ABN_POSCHANGED => {
                     bar::layout(hwnd);
                     raise_notches();
@@ -462,7 +472,10 @@ fn register_classes() {
 /// Pesan thread dari hook/thread latar: dibagikan ke semua jendela.
 fn handle_thread_message(msg: &MSG) {
     match msg.message {
-        media::WM_MEDIA_CHANGED => notches().into_iter().for_each(notch::on_media),
+        media::WM_MEDIA_CHANGED => {
+            notches().into_iter().for_each(notch::on_media);
+            popup::on_status_changed();
+        }
         status::WM_STATUS_CHANGED => {
             bars().into_iter().for_each(bar::redraw);
             popup::on_status_changed();
@@ -495,7 +508,9 @@ fn handle_thread_message(msg: &MSG) {
 fn main() {
     unsafe {
         // Satu instance saja.
-        let _guard = CreateMutexW(None, false, w!("Local\\HolmBarSingleton"));
+        // HOLM_INSTANCE (khusus pengembangan/uji): nama instance terpisah agar uji tidak bentrok dengan instance lain.
+        let mutex_name = wide(&format!("Local\\HolmBarSingleton{}", std::env::var("HOLM_INSTANCE").unwrap_or_default()));
+        let _guard = CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr()));
         if GetLastError() == ERROR_ALREADY_EXISTS {
             // Sudah berjalan: menjalankan HolmBar lagi membuka jendela Pengaturan.
             if let Ok(h) = FindWindowExW(Some(HWND_MESSAGE), None, IPC_CLASS, PCWSTR::null()) {
@@ -509,9 +524,11 @@ fn main() {
 
         taskbar::install_panic_guard();
         config::init();
+        taskbar::recover();
         canvas::startup();
         register_classes();
         settings::register();
+        menu::register();
         create_ipc_window();
 
         *CONFIG_STAMP.lock().unwrap() = config::mtime();

@@ -16,6 +16,12 @@ pub struct Config {
     pub launcher: Launcher,
     pub notifications: Notifications,
     pub tray: Tray,
+    pub control: Control,
+}
+
+#[derive(Deserialize)]
+pub struct Control {
+    pub modules: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -50,6 +56,9 @@ pub struct Dock {
     pub background: String,
     pub opacity: f32,
     pub reserve_space: bool,
+    pub reclaim_space: bool,
+    pub autohide: String,
+    pub autohide_delay_ms: u32,
     pub replace_taskbar: bool,
     pub pinned: Vec<String>,
     pub start_button: bool,
@@ -147,25 +156,68 @@ pub fn set_key(doc: &mut toml_edit::DocumentMut, sec: &str, key: &str, v: toml_e
     Ok(())
 }
 
+/// Tambah/hapus entri di `dock.pinned` pada config.toml (komentar & kunci lain tetap utuh).
+/// `remove` memakai pencocok karena entri bisa memakai %VAR% atau huruf besar-kecil berbeda.
+pub fn update_pinned(add: Option<&str>, remove: impl Fn(&str) -> bool) -> Result<(), String> {
+    let text = std::fs::read_to_string(path()).unwrap_or_default();
+    let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| e.to_string())?;
+    let mut list: Vec<String> = doc.get("dock").and_then(|d| d.get("pinned")).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_else(|| {
+        // Belum ditulis pengguna: mulai dari nilai bawaan agar pin bawaan tidak hilang.
+        load().map(|c| c.dock.pinned).unwrap_or_default()
+    });
+    list.retain(|e| !remove(e));
+    if let Some(a) = add {
+        if !list.iter().any(|e| e.eq_ignore_ascii_case(a)) {
+            list.push(a.to_string());
+        }
+    }
+    let arr: toml_edit::Array = list.iter().map(String::as_str).collect();
+    set_key(&mut doc, "dock", "pinned", toml_edit::Value::Array(arr))?;
+    let out = doc.to_string();
+    validate(&out)?;
+    let _ = std::fs::create_dir_all(dir());
+    std::fs::write(path(), out).map_err(|e| e.to_string())
+}
+
 /// Migrasi teks config lama. None = tidak ada yang perlu diubah.
 /// v2: ukuran notch bawaan lama (32 / 440 / 232) diganti ukuran baru yang lebih ringkas.
 fn migrate_text(text: &str) -> Option<String> {
     let mut doc = text.parse::<toml_edit::DocumentMut>().ok()?;
     let ver = doc.get("general").and_then(|g| g.get("config_version")).and_then(|v| v.as_integer()).unwrap_or(1);
-    if ver >= 3 {
+    if ver >= 6 {
         return None;
     }
     if ver < 2 {
         migrate_v2(&mut doc)?;
     }
     // v3: item "tray" ditambahkan di depan daftar kanan bar bila belum ada.
-    if let Some(arr) = doc.get_mut("bar").and_then(|b| b.get_mut("right")).and_then(|r| r.as_array_mut()) {
-        if !arr.iter().any(|v| v.as_str() == Some("tray")) {
-            arr.insert(0, "tray");
-            arr.fmt();
+    if ver < 3 {
+        if let Some(arr) = doc.get_mut("bar").and_then(|b| b.get_mut("right")).and_then(|r| r.as_array_mut()) {
+            if !arr.iter().any(|v| v.as_str() == Some("tray")) {
+                arr.insert(0, "tray");
+                arr.fmt();
+            }
         }
     }
-    set_key(&mut doc, "general", "config_version", 3i64.into()).ok()?;
+    // v4: logo bawaan lama (glyph Apple U+F302) diganti logo Windows vektor.
+    if doc.get("bar").and_then(|b| b.get("logo")).and_then(|v| v.as_str()) == Some("\u{f302}") {
+        set_key(&mut doc, "bar", "logo", "windows".into()).ok()?;
+    }
+    // v5: font bar bawaan lama (varian Display untuk ukuran besar) diganti varian Text untuk teks kecil.
+    if ver < 5 {
+        let bar_str = |doc: &toml_edit::DocumentMut, k: &str| doc.get("bar").and_then(|b| b.get(k)).and_then(|v| v.as_str().map(str::to_string));
+        if bar_str(&doc, "font").as_deref() == Some("Segoe UI Variable Display") {
+            set_key(&mut doc, "bar", "font", "Segoe UI Variable Text".into()).ok()?;
+        }
+        if doc.get("bar").and_then(|b| b.get("font_size")).and_then(|v| v.as_float()) == Some(12.5) {
+            set_key(&mut doc, "bar", "font_size", 13.0f64.into()).ok()?;
+        }
+    }
+    // v6: label desktop bawaan lama "Finder" diganti nama brand HolmBar (nilai buatan pengguna tidak disentuh).
+    if doc.get("bar").and_then(|b| b.get("desktop_label")).and_then(|v| v.as_str()) == Some("Finder") {
+        set_key(&mut doc, "bar", "desktop_label", "HolmBar".into()).ok()?;
+    }
+    set_key(&mut doc, "general", "config_version", 6i64.into()).ok()?;
     let out = doc.to_string();
     validate(&out).ok()?;
     Some(out)
@@ -321,8 +373,64 @@ expanded_height = 232
         assert!(out.contains("compact_height = 28   # tinggi"), "{out}");
         assert!(out.contains("expanded_width = 500"), "nilai buatan pengguna tidak disentuh: {out}");
         assert!(out.contains("expanded_height = 132"));
-        assert!(out.contains("config_version = 3"));
+        assert!(out.contains("config_version = 6"));
         assert!(migrate_text(&out).is_none(), "migrasi hanya sekali");
+    }
+
+    #[test]
+    fn update_pinned_adds_and_removes() {
+        let dir = std::env::temp_dir().join(format!("holm-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        std::fs::write(&file, "[dock]\npinned = [\"C:\\\\a.exe\"]   # pin\n").unwrap();
+        // update_pinned memakai path() dari APPDATA; uji lewat penyunting dokumen yang sama.
+        let mut doc: toml_edit::DocumentMut = std::fs::read_to_string(&file).unwrap().parse().unwrap();
+        let mut list: Vec<String> = doc["dock"]["pinned"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect();
+        list.retain(|e| !e.eq_ignore_ascii_case("C:\\a.exe"));
+        list.push("aumid:foo!app".into());
+        let arr: toml_edit::Array = list.iter().map(String::as_str).collect();
+        set_key(&mut doc, "dock", "pinned", toml_edit::Value::Array(arr)).unwrap();
+        let out = doc.to_string();
+        assert!(out.contains("aumid:foo!app") && !out.contains("a.exe") && out.contains("# pin"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrates_finder_label_to_brand() {
+        let old = "[general]
+config_version = 5
+
+[bar]
+desktop_label = \"Finder\"  # label
+";
+        let out = migrate_text(old).expect("perlu migrasi");
+        assert!(out.contains("desktop_label = \"HolmBar\"  # label"), "{out}");
+        let mine = "[general]
+config_version = 5
+
+[bar]
+desktop_label = \"Desktop\"
+";
+        assert!(migrate_text(mine).unwrap().contains("desktop_label = \"Desktop\""));
+    }
+
+    #[test]
+    fn migrates_display_font_to_text() {
+        let old = "[general]\nconfig_version = 4\n\n[bar]\nfont = \"Segoe UI Variable Display\"\nfont_size = 12.5\n";
+        let out = migrate_text(old).expect("perlu migrasi");
+        assert!(out.contains("font = \"Segoe UI Variable Text\""), "{out}");
+        assert!(out.contains("font_size = 13.0"), "{out}");
+        let mine = "[general]\nconfig_version = 4\n\n[bar]\nfont = \"Inter\"\n";
+        assert!(migrate_text(mine).unwrap().contains("font = \"Inter\""));
+    }
+
+    #[test]
+    fn migrates_apple_logo_to_windows() {
+        let old = "[general]\nconfig_version = 3\n\n[bar]\nlogo = \"\u{f302}\"   # logo\n";
+        let out = migrate_text(old).expect("perlu migrasi");
+        assert!(out.contains("logo = \"windows\"   # logo"), "{out}");
+        let custom = "[general]\nconfig_version = 3\n\n[bar]\nlogo = \"X\"\n";
+        assert!(migrate_text(custom).unwrap().contains("logo = \"X\""), "logo buatan pengguna tidak disentuh");
     }
 
     #[test]

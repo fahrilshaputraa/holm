@@ -3,7 +3,10 @@
 //! Satu jendela dipakai ulang. Menutup saat kehilangan fokus atau Esc.
 
 use crate::canvas::{Align, Canvas, Font, Image};
+use crate::icons::{self, Icon};
 use crate::config;
+use crate::control;
+use crate::media;
 use crate::monitors::Mon;
 use crate::radios::{self, Which};
 use crate::status;
@@ -27,6 +30,7 @@ pub enum Kind {
     Bluetooth,
     Launcher,
     Tray,
+    Control,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -45,6 +49,17 @@ enum Hit {
     PwCancel,
     BtToggle,
     BtDev,
+    CcWifi,
+    CcWifiOpen,
+    CcBt,
+    CcBtOpen,
+    CcAirplane,
+    CcDnd,
+    CcBright,
+    CcVol,
+    CcPlay,
+    CcNext,
+    CcSettings,
 }
 
 struct App {
@@ -61,6 +76,7 @@ struct P {
     rects: Vec<(Rect, Hit)>,
     hover: Option<Hit>,
     dragging: bool,
+    drag_hit: Option<Hit>,
     cal_off: i32,
     query: String,
     sel: usize,
@@ -84,6 +100,8 @@ thread_local! {
     static POP: RefCell<Option<P>> = const { RefCell::new(None) };
     static APPS: RefCell<(Vec<App>, Option<Instant>)> = const { RefCell::new((Vec::new(), None)) };
     static ICONS: RefCell<HashMap<String, Option<Image>>> = RefCell::new(HashMap::new());
+    /// Sampul lagu untuk kartu Now Playing di Control Center (di-decode ulang hanya saat berganti).
+    static CC_ART: RefCell<Option<(usize, Image)>> = const { RefCell::new(None) };
 }
 
 fn with<R>(f: impl FnOnce(&mut P) -> R) -> Option<R> {
@@ -149,6 +167,12 @@ impl Ui<'_> {
     fn hit(&mut self, r: Rect, h: Hit) {
         self.rects.push((r, h));
     }
+    /// Ikon filled di kotak `r` (potongan memakai warna kartu `bg`).
+    fn ic(&self, icon: Icon, r: Rect, col: u32, bg: u32) {
+        if let Some(c) = self.c {
+            icons::draw(c, icon, r, col, bg);
+        }
+    }
     fn hovered(&self, h: Hit) -> bool {
         self.hover == Some(h)
     }
@@ -175,6 +199,7 @@ fn build(ui: &mut Ui, kind: Kind, w: f32, cal_off: i32, query: &str, sel: usize)
         Kind::Wifi => build_wifi(ui, w),
         Kind::Bluetooth => build_bluetooth(ui, w),
         Kind::Tray => build_tray(ui, w),
+        Kind::Control => build_control(ui, w),
     }
 }
 
@@ -211,6 +236,223 @@ fn build_tray(ui: &mut Ui, w: f32) -> f32 {
     ui.text(if tip.is_empty() { "Klik kanan untuk menu aplikasi" } else { &tip }, (pad, y + 2.0 * s, w - 2.0 * pad, 18.0 * s), 11.5, false, if tip.is_empty() { 0xFF6E6E78 } else { WHITE }, Align::Center);
     y += 24.0 * s;
     y + pad - 6.0 * s
+}
+
+// ---------- Control Center ----------
+
+const CARD: u32 = 0x16FFFFFF;
+const CARD_BG: u32 = 0xFF2A2A2E; // perkiraan warna kartu di atas latar popup (untuk potongan ikon)
+const OFF_CIRCLE: u32 = 0xFF4A4A52;
+
+/// Baris kiri kartu konektivitas: lingkaran ikon (aksi `toggle`) + dua baris teks (aksi `open`).
+#[allow(clippy::too_many_arguments)]
+fn cc_row(ui: &mut Ui, r: Rect, icon: Icon, on: bool, title: &str, sub: &str, toggle: Hit, open: Hit) {
+    let s = ui.s;
+    let d = 34.0 * s;
+    let circ = (r.0 + 10.0 * s, r.1 + (r.3 - d) / 2.0, d, d);
+    let hov = ui.hovered(toggle) || ui.hovered(open);
+    ui.circle(circ.0 + d / 2.0, circ.1 + d / 2.0, d / 2.0, if on { ui.accent } else if hov { 0xFF5A5A62 } else { OFF_CIRCLE });
+    let k = 18.0 * s;
+    ui.ic(icon, (circ.0 + (d - k) / 2.0, circ.1 + (d - k) / 2.0, k, k), WHITE, if on { ui.accent } else { OFF_CIRCLE });
+    let tx = circ.0 + d + 10.0 * s;
+    let tw = r.0 + r.2 - tx - 6.0 * s;
+    ui.text(title, (tx, r.1 + r.3 / 2.0 - 17.0 * s, tw, 18.0 * s), 13.0, true, WHITE, Align::Near);
+    ui.text(sub, (tx, r.1 + r.3 / 2.0 + 1.0 * s, tw, 16.0 * s), 11.0, false, DIM, Align::Near);
+    ui.hit((tx - 4.0 * s, r.1, r.0 + r.2 - tx + 4.0 * s, r.3), open);
+    ui.hit(circ, toggle); // ditambahkan terakhir: menang atas area teks
+}
+
+/// Ubin kanan: lingkaran ikon di kiri + label dua baris.
+fn cc_tile(ui: &mut Ui, r: Rect, icon: Icon, on: bool, line1: &str, line2: &str, h: Hit) {
+    let s = ui.s;
+    ui.round(r, 14.0, if ui.hovered(h) { 0x24FFFFFF } else { CARD });
+    let d = 32.0 * s;
+    let circ = (r.0 + 10.0 * s, r.1 + (r.3 - d) / 2.0, d, d);
+    ui.circle(circ.0 + d / 2.0, circ.1 + d / 2.0, d / 2.0, if on { ui.accent } else { OFF_CIRCLE });
+    let k = 17.0 * s;
+    ui.ic(icon, (circ.0 + (d - k) / 2.0, circ.1 + (d - k) / 2.0, k, k), WHITE, if on { ui.accent } else { OFF_CIRCLE });
+    let tx = circ.0 + d + 8.0 * s;
+    let tw = r.0 + r.2 - tx - 4.0 * s;
+    let (y1, y2) = if line2.is_empty() { (r.1 + r.3 / 2.0 - 9.0 * s, 0.0) } else { (r.1 + r.3 / 2.0 - 18.0 * s, r.1 + r.3 / 2.0) };
+    ui.text(line1, (tx, y1, tw, 18.0 * s), 12.5, true, WHITE, Align::Near);
+    if !line2.is_empty() {
+        ui.text(line2, (tx, y2, tw, 18.0 * s), 12.5, true, WHITE, Align::Near);
+    }
+    ui.hit(r, h);
+}
+
+/// Kartu slider besar ala macOS: label di atas, trek bulat dengan ikon di dalamnya.
+fn cc_slider(ui: &mut Ui, r: Rect, label: &str, icon: Icon, frac: f32, slider: Hit, icon_hit: Option<Hit>) {
+    let s = ui.s;
+    ui.round(r, 14.0, CARD);
+    ui.text(label, (r.0 + 14.0 * s, r.1 + 8.0 * s, r.2 - 28.0 * s, 18.0 * s), 12.0, true, WHITE, Align::Near);
+    let track = (r.0 + 10.0 * s, r.1 + r.3 - 10.0 * s - 28.0 * s, r.2 - 20.0 * s, 28.0 * s);
+    let frac = frac.clamp(0.0, 1.0);
+    ui.round(track, 14.0, 0x30FFFFFF);
+    let fw = (track.2 * frac).max(track.3);
+    ui.round((track.0, track.1, fw, track.3), 14.0, 0xFFF4F4F6);
+    let k = 16.0 * s;
+    let over_fill = fw > 30.0 * s;
+    ui.ic(icon, (track.0 + 7.0 * s, track.1 + (track.3 - k) / 2.0, k, k), if over_fill { 0xFF6A6A72 } else { 0xFFC8C8D0 }, if over_fill { 0xFFF4F4F6 } else { 0xFF4A4A50 });
+    ui.hit(track, slider);
+    if let Some(h) = icon_hit {
+        ui.hit((track.0, track.1, 30.0 * s, track.3), h);
+    }
+}
+
+fn build_control(ui: &mut Ui, w: f32) -> f32 {
+    let (s, pad, gap) = (ui.s, 14.0 * ui.s, 10.0 * ui.s);
+    let inner = w - 2.0 * pad;
+    let mut y = pad;
+    let mods = config::current().control.modules.clone();
+    let on_m = |m: &str| mods.iter().any(|x| x.eq_ignore_ascii_case(m));
+
+    // Konektivitas (kiri) + Jangan Ganggu / Proyeksi (kanan); hanya modul yang dipilih di Pengaturan.
+    let (lw, row_h) = (inner * 0.58, 52.0 * s);
+    let wifi_on = radios::is_on(Which::Wifi);
+    let bt_on = radios::is_on(Which::Bluetooth);
+    let air = control::airplane();
+    let mut rows: Vec<(Icon, bool, &str, String, Hit, Hit)> = Vec::new();
+    if on_m("wifi") {
+        let ssid = WIFI.with(|v| v.borrow().nets.iter().find(|n| n.connected).map(|n| n.ssid.clone()));
+        let sub = match wifi_on {
+            Some(true) => ssid.unwrap_or_else(|| "Menyala".into()),
+            Some(false) => "Mati".into(),
+            None => "Tidak tersedia".into(),
+        };
+        rows.push((Icon::Wifi, wifi_on == Some(true), "Wi-Fi", sub, Hit::CcWifi, Hit::CcWifiOpen));
+    }
+    if on_m("bluetooth") {
+        let dev = radios::bt_devices().into_iter().find(|d| d.connected).map(|d| d.name);
+        let sub = match bt_on {
+            Some(true) => dev.unwrap_or_else(|| "Menyala".into()),
+            Some(false) => "Mati".into(),
+            None => "Tidak tersedia".into(),
+        };
+        rows.push((Icon::Bluetooth, bt_on == Some(true), "Bluetooth", sub, Hit::CcBt, Hit::CcBtOpen));
+    }
+    if on_m("airplane") {
+        rows.push((Icon::Airplane, air, "Mode Pesawat", if air { "Menyala".into() } else { "Mati".into() }, Hit::CcAirplane, Hit::CcAirplane));
+    }
+    let mut tiles: Vec<(Icon, bool, &str, &str, Hit)> = Vec::new();
+    if on_m("dnd") {
+        tiles.push((Icon::Moon, control::dnd(), "Jangan", "Ganggu", Hit::CcDnd));
+    }
+    if on_m("cast") {
+        tiles.push((Icon::Monitor, false, "Proyeksi", "", Hit::Uri("ms-settings-connectabledevices:devicediscovery")));
+    }
+    let have_card = !rows.is_empty();
+    let card_h = if have_card { row_h * rows.len().max(2) as f32 + 12.0 * s } else { 0.0 };
+    if have_card {
+        let card = (pad, y, if tiles.is_empty() { inner } else { lw }, card_h);
+        ui.round(card, 14.0, CARD);
+        let n = rows.len();
+        let top = y + (card_h - n as f32 * row_h) / 2.0;
+        for (i, (icon, on, title, sub, toggle, open)) in rows.into_iter().enumerate() {
+            cc_row(ui, (card.0, top + i as f32 * row_h, card.2, row_h), icon, on, title, &sub, toggle, open);
+        }
+    }
+    let drew_tiles = !tiles.is_empty();
+    if !tiles.is_empty() {
+        let n = tiles.len() as f32;
+        if have_card {
+            let (tx, tw) = (pad + lw + gap, inner - lw - gap);
+            let th = (card_h - gap * (n - 1.0)) / n;
+            for (i, (icon, on, l1, l2, h)) in tiles.into_iter().enumerate() {
+                cc_tile(ui, (tx, y + i as f32 * (th + gap), tw, th), icon, on, l1, l2, h);
+            }
+        } else {
+            let tw = (inner - gap * (n - 1.0)) / n;
+            for (i, (icon, on, l1, l2, h)) in tiles.into_iter().enumerate() {
+                cc_tile(ui, (pad + i as f32 * (tw + gap), y, tw, 64.0 * s), icon, on, l1, l2, h);
+            }
+        }
+    }
+    if have_card {
+        y += card_h + gap;
+    } else if drew_tiles {
+        y += 64.0 * s + gap;
+    }
+
+    // Kecerahan (hanya layar internal) dan suara.
+    if let (true, Some(b)) = (on_m("display"), control::brightness()) {
+        cc_slider(ui, (pad, y, inner, 70.0 * s), "Layar", Icon::Sun, b as f32 / 100.0, Hit::CcBright, None);
+        y += 70.0 * s + gap;
+    }
+    if on_m("sound") {
+        let v = status::volume().unwrap_or(status::Volume { level: 0.0, muted: false });
+        let lvl = if v.muted { 0.0 } else { v.level };
+        let sp = if v.muted || lvl <= 0.001 { 0 } else if lvl < 0.34 { 1 } else if lvl < 0.67 { 2 } else { 3 };
+        cc_slider(ui, (pad, y, inner, 70.0 * s), "Suara", Icon::Speaker(sp), lvl, Hit::CcVol, Some(Hit::VolMute));
+        y += 70.0 * s + gap;
+    }
+
+    // Now Playing.
+    if on_m("media") {
+        y = cc_now_playing(ui, pad, y, inner, gap);
+    }
+
+    // Baris bawah: baterai + pengaturan HolmBar.
+    let fy = y + 2.0 * s;
+    if let Some((pct, charging)) = crate::bar::battery() {
+        ui.ic(Icon::Battery(pct), (pad + 4.0 * s, fy + 3.0 * s, 20.0 * s, 20.0 * s), if charging { 0xFF30D158 } else if pct <= 20 { 0xFFFF453A } else { WHITE }, 0xFF1E1E22);
+        ui.text(&format!("{pct}%{}", if charging { "  ·  Mengisi" } else { "" }), (pad + 30.0 * s, fy, 150.0 * s, 26.0 * s), 12.0, false, DIM, Align::Near);
+    }
+    let gr = (pad + inner - 28.0 * s, fy, 28.0 * s, 26.0 * s);
+    if ui.hovered(Hit::CcSettings) {
+        ui.round(gr, 8.0, 0x26FFFFFF);
+    }
+    ui.ic(Icon::Gear, (gr.0 + 6.0 * s, gr.1 + 4.0 * s, 18.0 * s, 18.0 * s), DIM, 0xFF1E1E22);
+    ui.hit(gr, Hit::CcSettings);
+    y + 26.0 * s + pad
+}
+
+/// Kartu Now Playing; mengembalikan y berikutnya.
+fn cc_now_playing(ui: &mut Ui, pad: f32, y: f32, inner: f32, gap: f32) -> f32 {
+    let s = ui.s;
+    let info = media::info();
+    let np = (pad, y, inner, 64.0 * s);
+    ui.round(np, 14.0, CARD);
+    let asz = 44.0 * s;
+    let art_r = (np.0 + 10.0 * s, np.1 + (np.3 - asz) / 2.0, asz, asz);
+    if let Some(c) = ui.c {
+        let want = info.thumb.as_ref().map(|t| std::sync::Arc::as_ptr(t) as usize);
+        CC_ART.with(|a| {
+            let mut a = a.borrow_mut();
+            match (want, a.as_ref().map(|(p, _)| *p)) {
+                (Some(p), Some(q)) if p == q => {}
+                (Some(p), _) => *a = info.thumb.as_ref().and_then(|t| Image::from_bytes(t)).map(|i| (p, i)),
+                (None, _) => *a = None,
+            }
+            match a.as_ref() {
+                Some((_, img)) => c.draw_image(img, art_r.0, art_r.1, art_r.2, art_r.3, 8.0 * s, 1.0),
+                None => {
+                    c.fill_round_rect(art_r.0, art_r.1, art_r.2, art_r.3, (8.0 * s, 8.0 * s, 8.0 * s, 8.0 * s), 0xFF3A3A40);
+                    icons::draw(c, Icon::Music, (art_r.0 + 11.0 * s, art_r.1 + 11.0 * s, 22.0 * s, 22.0 * s), 0xFF8E8E98, 0xFF3A3A40);
+                }
+            }
+        });
+    }
+    let bx = np.0 + np.2 - 10.0 * s;
+    let (bd, by) = (34.0 * s, np.1 + np.3 / 2.0);
+    let tx = art_r.0 + asz + 10.0 * s;
+    let tw = (bx - 2.0 * bd - 6.0 * s - tx).max(40.0 * s);
+    if info.active {
+        ui.text(if info.title.is_empty() { "Tanpa judul" } else { &info.title }, (tx, by - 18.0 * s, tw, 18.0 * s), 13.0, true, WHITE, Align::Near);
+        ui.text(&info.artist, (tx, by + 1.0 * s, tw, 16.0 * s), 11.0, false, DIM, Align::Near);
+        for (i, (h, icon)) in [(Hit::CcPlay, if info.playing { Icon::Pause } else { Icon::Play }), (Hit::CcNext, Icon::Next)].into_iter().enumerate() {
+            let r = (bx - (2 - i) as f32 * bd, by - bd / 2.0, bd, bd);
+            if ui.hovered(h) {
+                ui.circle(r.0 + bd / 2.0, r.1 + bd / 2.0, bd / 2.0, 0x26FFFFFF);
+            }
+            let k = 15.0 * s;
+            ui.ic(icon, (r.0 + (bd - k) / 2.0, r.1 + (bd - k) / 2.0, k, k), WHITE, CARD_BG);
+            ui.hit(r, h);
+        }
+    } else {
+        ui.text("Tidak ada media", (tx, by - 9.0 * s, tw + bd * 2.0, 18.0 * s), 13.0, false, DIM, Align::Near);
+    }
+    y + np.3 + gap
 }
 
 /// Daftar ikon tray berubah: segarkan popup bila sedang terbuka.
@@ -567,6 +809,34 @@ fn icon_for(path: &str) {
     });
 }
 
+/// Ikon aplikasi dari nama tampilannya (mis. nama pengirim notifikasi), dicocokkan dengan Start Menu.
+pub fn app_icon(name: &str) -> Option<Image> {
+    let q = name.trim().to_lowercase();
+    if q.len() < 2 {
+        return None;
+    }
+    ensure_apps();
+    let path = APPS.with(|a| {
+        a.borrow()
+            .0
+            .iter()
+            .filter(|x| x.lower == q || x.lower.starts_with(&q) || q.starts_with(&x.lower) || x.lower.contains(&q))
+            .min_by_key(|x| (if x.lower == q { 0 } else { 1 }, x.lower.len()))
+            .map(|x| x.path.clone())
+    })?;
+    let w: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut info = SHFILEINFOW::default();
+    unsafe {
+        let r = SHGetFileInfoW(PCWSTR(w.as_ptr()), Default::default(), Some(&mut info), std::mem::size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | SHGFI_LARGEICON);
+        if r == 0 || info.hIcon.0.is_null() {
+            return None;
+        }
+        let img = Image::from_hicon(info.hIcon);
+        let _ = DestroyIcon(info.hIcon);
+        img
+    }
+}
+
 fn build_launcher(ui: &mut Ui, w: f32, query: &str, sel: usize) -> f32 {
     let (s, pad) = (ui.s, 16.0 * ui.s);
     // Kotak pencarian.
@@ -632,6 +902,7 @@ fn render() {
         Kind::Wifi | Kind::Bluetooth => 340.0,
         Kind::Launcher => 600.0,
         Kind::Tray => (crate::tray::split().1.len().clamp(1, TRAY_COLS) as f32 * TRAY_CELL + 24.0).max(220.0),
+        Kind::Control => 344.0,
     } * s;
     let accent = config::color(&cfg.general.accent);
     let mut ui = Ui { c: None, s, font: cfg.bar.font.clone(), accent, hover, rects: Vec::new() };
@@ -687,6 +958,7 @@ fn ensure_window() -> Option<HWND> {
                 rects: Vec::new(),
                 hover: None,
                 dragging: false,
+                drag_hit: None,
                 cal_off: 0,
                 query: String::new(),
                 sel: 0,
@@ -695,6 +967,11 @@ fn ensure_window() -> Option<HWND> {
         });
         Some(h)
     }
+}
+
+/// Popup apa pun sedang tampil (dipakai penjaga z-order notch agar tidak menutupinya).
+pub fn any_open() -> bool {
+    with(|p| unsafe { IsWindowVisible(p.hwnd) }.as_bool()).unwrap_or(false)
 }
 
 pub fn is_open(kind: Kind) -> bool {
@@ -753,6 +1030,16 @@ pub fn toggle(kind: Kind, anchor_x: f32, mon: Mon) {
             radios::refresh();
             radios::refresh_bt_devices();
         }
+        Kind::Control => {
+            WIFI.with(|v| v.borrow_mut().nets = status::networks());
+            status::wifi_scan();
+            radios::refresh();
+            radios::refresh_bt_devices();
+            control::refresh_brightness();
+            unsafe {
+                SetTimer(Some(h), TIMER_RESCAN, 2500, None);
+            }
+        }
         _ => {}
     }
     render();
@@ -785,6 +1072,9 @@ pub fn on_status_changed() {
         render();
     } else if is_open(Kind::Bluetooth) {
         render();
+    } else if is_open(Kind::Control) && !with(|p| p.dragging).unwrap_or(false) {
+        WIFI.with(|v| v.borrow_mut().nets = status::networks());
+        render();
     }
 }
 
@@ -792,15 +1082,34 @@ fn hit_at(x: f32, y: f32) -> Option<Hit> {
     with(|p| p.rects.iter().rev().find(|(r, _)| x >= r.0 && x <= r.0 + r.2 && y >= r.1 && y <= r.1 + r.3).map(|(_, h)| *h)).flatten()
 }
 
-fn slider_value(x: f32) -> Option<f32> {
+fn slider_value(x: f32, hit: Hit) -> Option<f32> {
     with(|p| {
-        p.rects.iter().find(|(_, h)| *h == Hit::VolSlider).map(|(r, _)| {
-            let s = p.mon.scale;
-            let (tx, tw) = (r.0 + 8.0 * s, r.2 - 16.0 * s);
+        p.rects.iter().find(|(_, h)| *h == hit).map(|(r, _)| {
+            // Slider popup Suara punya padding 8 DIP di rect-nya; slider Control Center memakai rect trek apa adanya.
+            let pad = if hit == Hit::VolSlider { 8.0 * p.mon.scale } else { 0.0 };
+            let (tx, tw) = (r.0 + pad, r.2 - 2.0 * pad);
             ((x - tx) / tw).clamp(0.0, 1.0)
         })
     })
     .flatten()
+}
+
+/// Terapkan nilai slider saat diklik/diseret.
+fn drag_apply(hit: Option<Hit>, x: f32) {
+    let Some(h) = hit else { return };
+    let Some(v) = slider_value(x, h) else { return };
+    match h {
+        Hit::VolSlider => status::change_volume(v),
+        Hit::CcVol => {
+            status::change_volume(v);
+            render();
+        }
+        Hit::CcBright => {
+            control::set_brightness((v * 100.0).round().max(3.0) as u32);
+            render();
+        }
+        _ => {}
+    }
 }
 
 fn launch(path: &str) {
@@ -853,6 +1162,29 @@ fn activate(h: Hit) {
             radios::set(Which::Bluetooth, !on);
         }
         Hit::BtDev => {}
+        Hit::CcWifi => activate(Hit::WifiToggle),
+        Hit::CcBt => activate(Hit::BtToggle),
+        Hit::CcWifiOpen | Hit::CcBtOpen => {
+            if let Some((ax, mon)) = with(|p| (p.anchor_x, p.mon)) {
+                toggle(if h == Hit::CcWifiOpen { Kind::Wifi } else { Kind::Bluetooth }, ax, mon);
+            }
+        }
+        Hit::CcAirplane => control::set_airplane(!control::airplane()),
+        Hit::CcDnd => {
+            control::set_dnd(!control::dnd());
+            render();
+        }
+        Hit::CcPlay => {
+            media::send(media::Command::TogglePlayPause);
+        }
+        Hit::CcNext => {
+            media::send(media::Command::Next);
+        }
+        Hit::CcSettings => {
+            hide();
+            crate::handle_command(crate::IDM_SETTINGS);
+        }
+        Hit::CcBright | Hit::CcVol => {}
         Hit::PwCancel => {
             WIFI.with(|v| {
                 let mut v = v.borrow_mut();
@@ -946,9 +1278,8 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         WM_MOUSEMOVE => {
             let (x, y) = xy(lparam);
             if with(|p| p.dragging).unwrap_or(false) {
-                if let Some(v) = slider_value(x) {
-                    status::change_volume(v);
-                }
+                let h = with(|p| p.drag_hit).flatten();
+                drag_apply(h, x);
                 return LRESULT(0);
             }
             let h = hit_at(x, y);
@@ -959,14 +1290,16 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         }
         WM_LBUTTONDOWN => {
             let (x, y) = xy(lparam);
-            if hit_at(x, y) == Some(Hit::VolSlider) {
-                with(|p| p.dragging = true);
+            let h = hit_at(x, y);
+            if matches!(h, Some(Hit::VolSlider | Hit::CcVol | Hit::CcBright)) {
+                with(|p| {
+                    p.dragging = true;
+                    p.drag_hit = h;
+                });
                 unsafe {
                     SetCapture(hwnd);
                 }
-                if let Some(v) = slider_value(x) {
-                    status::change_volume(v);
-                }
+                drag_apply(h, x);
             }
             LRESULT(0)
         }
@@ -1000,7 +1333,7 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     unsafe {
                         let _ = KillTimer(Some(hwnd), TIMER_RESCAN);
                     }
-                    if is_open(Kind::Wifi) {
+                    if is_open(Kind::Wifi) || is_open(Kind::Control) {
                         WIFI.with(|v| v.borrow_mut().nets = status::networks());
                         render();
                     }
@@ -1124,4 +1457,23 @@ pub fn destroy() {
         }
     }
     POP.with(|p| *p.borrow_mut() = None);
+}
+
+#[cfg(test)]
+mod icon_probe {
+    #[test]
+    #[ignore]
+    fn start_menu_match_for_powershell() {
+        crate::canvas::startup();
+        super::ensure_apps();
+        let q = "windows powershell 5.1";
+        super::APPS.with(|a| {
+            let a = a.borrow();
+            println!("apps di Start Menu: {}", a.0.len());
+            for x in a.0.iter().filter(|x| x.lower == q || x.lower.starts_with(q) || q.starts_with(&x.lower) || x.lower.contains(q)) {
+                println!("  cocok: '{}' -> {}", x.name, x.path);
+            }
+        });
+        println!("app_icon = {}", super::app_icon("Windows PowerShell 5.1").is_some());
+    }
 }

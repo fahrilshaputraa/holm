@@ -308,6 +308,12 @@ pub fn redraw(hwnd: HWND) {
                 }
                 None => (0.0, None), // PC desktop: tidak ada baterai, jangan dipalsukan
             },
+            "control_center" => {
+                let isz = 16.0 * s;
+                let opaque = config::color(&cfg.bar.background) | 0xFF00_0000;
+                crate::icons::draw(&c, crate::icons::Icon::Toggles, (rx - isz, (fh - isz) / 2.0, isz, isz), dim, opaque);
+                (isz, Some(Action::Popup(crate::popup::Kind::Control)))
+            }
             other => {
                 use crate::status::Wifi;
                 let mut color = dim;

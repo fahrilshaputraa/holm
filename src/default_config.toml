@@ -4,7 +4,7 @@
 # Warna: "#RRGGBB" atau "#AARRGGBB".
 
 [general]
-config_version = 3         # dipakai untuk migrasi otomatis; jangan diubah
+config_version = 6         # dipakai untuk migrasi otomatis; jangan diubah
 language = "id"            # "id" | "en"  (nama hari & bulan pada jam)
 accent = "#0A84FF"          # warna sorotan popup (kalender, slider, pilihan)
 
@@ -16,11 +16,11 @@ background = "#18181B"
 opacity = 0.90
 text = "#FFFFFF"
 dim_text = "#E2E2E6"
-font = "Segoe UI Variable Display"
+font = "Segoe UI Variable Text"   
 icon_font = "JetBrainsMono NFP"   # Nerd Font; fallback ke Segoe UI Symbol
-font_size = 12.5
-logo = ""
-desktop_label = "Finder"           # nama yang tampil saat explorer.exe aktif
+font_size = 13
+logo = "windows"
+desktop_label = "HolmBar"          # nama yang tampil di bar saat explorer.exe/desktop aktif (bebas diubah)
 menus = ["File", "Edit", "View", "Window", "Help"]
 # Urutan kiri -> kanan. Pilihan: tray, wifi, volume, bluetooth, battery, control_center, clock
 right = ["tray", "bluetooth", "wifi", "volume", "battery", "control_center", "clock"]
@@ -58,6 +58,10 @@ icon_size = 13          # ukuran ikon di bar (px)
 pinned = []             # selalu langsung di bar, mis. ["discord.exe", "onedrive"] (nama exe atau teks tooltip)
 hidden = []             # tidak pernah ditampilkan
 
+[control]
+# Isi popup Control Center (ikon di bar). Pilihan: wifi, bluetooth, airplane, dnd, cast, display, sound, media
+modules = ["wifi", "bluetooth", "airplane", "dnd", "cast", "display", "sound", "media"]
+
 [lyrics]
 # Mengambil lirik dari lrclib.net (hanya judul, artis, dan durasi lagu yang dikirim).
 enabled = true
@@ -71,7 +75,10 @@ icon_size = 48
 magnification = 1.7          # 1.0 = tanpa pembesaran
 background = "#1C1C20"
 opacity = 0.55
-reserve_space = true          # sisihkan ruang agar jendela maksimal tidak menutupi dock
+reserve_space = true          # sisihkan ruang agar jendela maksimal tidak menutupi dock (diabaikan bila autohide aktif)
+autohide = "smart"            # "off" | "smart" (sembunyi bila ada jendela menutupi Dock) | "always" (sembunyi saat kursor pergi)
+autohide_delay_ms = 350       # jeda sebelum Dock bersembunyi; arahkan kursor ke tepi bawah layar untuk memunculkannya
+reclaim_space = true           # lepas ruang taskbar yang disembunyikan agar jendela memakai layar penuh (pengaturan auto-hide taskbar dipulihkan saat keluar)
 replace_taskbar = true         # true = sembunyikan taskbar Windows & Dock menggantikannya (dipulihkan saat keluar)
 # Aplikasi yang selalu tampil (path .exe; boleh memakai %VAR%).
 pinned = ["%SystemRoot%\\explorer.exe"]

@@ -26,6 +26,8 @@ const TIMER_ANIM: usize = 1;
 const TIMER_CLOSE: usize = 2;
 const TIMER_TICK: usize = 3;
 const TIMER_NOTIF: usize = 4;
+/// Penjaga z-order: AppBar bar/Dock sering menaikkan bar ke atas notch (notch jadi tertutup dan tidak bisa di-hover).
+const TIMER_Z: usize = 5;
 const FRAME_MS: u32 = 16;
 
 const TIMER_COLOR: u32 = 0xFFFF9F0A;
@@ -361,6 +363,9 @@ fn with<R>(hwnd: HWND, f: impl FnOnce(&mut State) -> R) -> Option<R> {
 }
 
 pub fn attach(hwnd: HWND, mon: Mon) {
+    unsafe {
+        SetTimer(Some(hwnd), TIMER_Z, 400, None);
+    }
     let tab = Tab::parse(&config::current().notch.default_tab).filter(|t| tabs().contains(t)).unwrap_or(tabs()[0]);
     WINS.with(|w| {
         w.borrow_mut().insert(
@@ -849,7 +854,7 @@ fn draw_compact(c: &Canvas, items: &Compact, art: Option<&Image>, info: &MediaIn
 
 /// Ukuran badan kartu notifikasi (lebar, tinggi total termasuk strip bar di atasnya).
 fn notif_dims(s: f32, ch: f32) -> (f32, f32) {
-    (372.0 * s, ch + 66.0 * s)
+    (360.0 * s, ch + 54.0 * s)
 }
 
 /// Pusat tombol tutup (X) pada kartu notifikasi.
@@ -861,11 +866,12 @@ fn draw_notif(hwnd: HWND, c: &Canvas, body_w: f32, ear: f32, ch: f32, s: f32, fa
     let cfg = config::current();
     let Some((toast, hover)) = with(hwnd, |st| st.notif.clone().map(|t| (t, st.hover))).flatten() else { return };
     let a = |col: u32| config::with_alpha(col, fade * ((col >> 24) as f32 / 255.0));
-    let (pad, isz) = (16.0 * s, 46.0 * s);
+    let (pad, isz) = (14.0 * s, 38.0 * s);
     let (_, nh) = notif_dims(s, ch);
     let iy = ch + (nh - ch - isz) / 2.0;
+    let ty = ch + 4.0 * s; // blok teks: rapat ke strip bar, tanpa celah kosong di atas
     let ix = ear + pad;
-    let r = 11.0 * s;
+    let r = 9.0 * s;
 
     let drawn = with(hwnd, |st| match &st.notif_img {
         Some(img) => {
@@ -879,16 +885,16 @@ fn draw_notif(hwnd: HWND, c: &Canvas, body_w: f32, ear: f32, ch: f32, s: f32, fa
         // Tanpa gambar banner: monogram dari nama aplikasi/judul.
         c.fill_round_rect(ix, iy, isz, isz, (r, r, r, r), a(config::with_alpha(accent, 0.85)));
         let mono = toast.app.chars().chain(toast.title.chars()).find(|ch| ch.is_alphanumeric()).map(|ch| ch.to_uppercase().to_string()).unwrap_or_else(|| "!".into());
-        c.text(&mono, &Font::new(font, 21.0 * s, true), (ix, iy, isz, isz), a(0xFFFFFFFF), Align::Center);
+        c.text(&mono, &Font::new(font, 18.0 * s, true), (ix, iy, isz, isz), a(0xFFFFFFFF), Align::Center);
     }
 
     let tx = ix + isz + 12.0 * s;
     let tw = (ear + body_w - pad - tx - 22.0 * s).max(10.0);
     let app = if toast.app.is_empty() { "Notifikasi" } else { toast.app.as_str() };
-    c.text(app, &Font::new(font, 10.5 * s, false), (tx, iy - 3.0 * s, tw, 14.0 * s), a(0xFF8E8E98), Align::Near);
-    c.text(&toast.title, &Font::new(font, 13.5 * s, true), (tx, iy + 11.0 * s, tw, 19.0 * s), a(0xFFFFFFFF), Align::Near);
+    c.text(app, &Font::new(font, 10.5 * s, false), (tx, ty, tw, 14.0 * s), a(0xFF8E8E98), Align::Near);
+    c.text(&toast.title, &Font::new(font, 13.5 * s, true), (tx, ty + 13.0 * s, tw, 19.0 * s), a(0xFFFFFFFF), Align::Near);
     if cfg.notifications.show_body && !toast.body.is_empty() {
-        c.text(&toast.body, &Font::new(font, 12.0 * s, false), (tx, iy + 30.0 * s, tw, 17.0 * s), a(0xFFB4B4BE), Align::Near);
+        c.text(&toast.body, &Font::new(font, 12.0 * s, false), (tx, ty + 31.0 * s, tw, 17.0 * s), a(0xFFB4B4BE), Align::Near);
     }
 
     if hover {
@@ -920,7 +926,8 @@ fn advance_notif(hwnd: HWND) -> bool {
             return false;
         }
         let Some(t) = st.queue.pop_front() else { return false };
-        st.notif_img = t.icon.as_ref().and_then(|b| Image::from_bytes(b));
+        // Ikon asli: gambar banner bila tertangkap; kalau tidak, ikon aplikasi yang cocok dengan nama pengirim.
+        st.notif_img = t.icon.as_ref().and_then(|b| Image::from_bytes(b)).or_else(|| crate::popup::app_icon(&t.app));
         st.notif = Some(t);
         st.n_target = true;
         st.hover = false;
@@ -1344,6 +1351,14 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     start_anim(hwnd, false);
                 }
                 TIMER_NOTIF => dismiss_notif(hwnd),
+                TIMER_Z => {
+                    // Jangan merebut posisi atas dari menu/popup yang sedang terbuka (mereka sengaja di atas notch).
+                    if !crate::FULLSCREEN.load(std::sync::atomic::Ordering::Relaxed) && !crate::menu::is_open() && !crate::popup::any_open() {
+                        unsafe {
+                            let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                        }
+                    }
+                }
                 TIMER_TICK => {
                     if check_alarm() {
                         unsafe {

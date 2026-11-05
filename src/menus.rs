@@ -179,11 +179,9 @@ fn run(act: Act, owner: HWND, target: Option<HWND>) {
         Act::Launcher => crate::popup::open_launcher(),
         Act::Exec(f, a) => shell(f, a, SW_HIDE),
         Act::Confirm(q, f, a) => {
-            let (qq, cap) = (wide(q), wide("HolmBar"));
-            let r = unsafe { MessageBoxW(Some(owner), PCWSTR(qq.as_ptr()), PCWSTR(cap.as_ptr()), MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_TOPMOST | MB_SETFOREGROUND) };
-            if r == IDYES {
-                shell(f, a, SW_HIDE);
-            }
+            let _ = owner;
+            let yes = if f == "shutdown.exe" && a.starts_with("/s") { "Matikan" } else if f == "shutdown.exe" && a.starts_with("/r") { "Restart" } else { "Keluar" };
+            crate::menu::confirm(q, yes, move || shell(f, a, SW_HIDE));
         }
         Act::Settings => unsafe {
             let _ = PostMessageW(Some(owner), WM_COMMAND, WPARAM(crate::IDM_SETTINGS), LPARAM(0));
@@ -201,31 +199,27 @@ fn run(act: Act, owner: HWND, target: Option<HWND>) {
 }
 
 /// Tampilkan menu di (x, y) layar dan jalankan pilihan. `target` = jendela aplikasi aktif.
-fn show(owner: HWND, items: Vec<Item>, x: i32, y: i32, target: Option<HWND>, up: bool) {
-    unsafe {
-        let Ok(menu) = CreatePopupMenu() else { return };
-        if items.is_empty() {
-            let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, w!("(Tidak ada item)"));
-        }
-        for (i, item) in items.iter().enumerate() {
-            match item.act {
-                Act::Sep => {
-                    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-                }
-                _ => {
-                    let text = if item.hint.is_empty() { item.label.to_string() } else { format!("{}\t{}", item.label, item.hint) };
-                    let t = wide(&text);
-                    let _ = AppendMenuW(menu, MF_STRING, i + 1, PCWSTR(t.as_ptr()));
-                }
-            }
-        }
-        let _ = SetForegroundWindow(owner);
-        let cmd = TrackPopupMenuEx(menu, (TPM_LEFTALIGN | if up { TPM_BOTTOMALIGN } else { TPM_TOPALIGN } | TPM_RETURNCMD).0, x, y, owner, None).0 as usize;
-        let _ = DestroyMenu(menu);
-        if cmd > 0 && cmd <= items.len() {
-            run(items[cmd - 1].act, owner, target);
-        }
+/// Membuka ke bawah dan otomatis ke atas bila tidak muat (mis. dari Dock).
+fn show(owner: HWND, items: Vec<Item>, x: i32, y: i32, target: Option<HWND>, _up: bool) {
+    let mut list: Vec<crate::menu::MenuItem> = items
+        .iter()
+        .enumerate()
+        .map(|(i, it)| match it.act {
+            Act::Sep => crate::menu::MenuItem::sep(),
+            _ => crate::menu::MenuItem::new(it.label, it.hint, i + 1),
+        })
+        .collect();
+    if list.is_empty() {
+        let mut m = crate::menu::MenuItem::new("(Tidak ada item)", "", 0);
+        m.disabled = true;
+        list.push(m);
     }
+    let (o, t) = (owner.0 as isize, target.map(|h| h.0 as isize));
+    crate::menu::show(list, x, y, move |id| {
+        if id > 0 && id <= items.len() {
+            run(items[id - 1].act, HWND(o as *mut _), t.map(|h| HWND(h as *mut _)));
+        }
+    });
 }
 
 pub fn show_start_menu(owner: HWND, x: i32, y: i32) {
