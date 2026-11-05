@@ -29,6 +29,8 @@ pub struct MediaInfo {
     stamp: Instant,
     /// Bytes gambar sampul (PNG/JPEG) bila tersedia.
     pub thumb: Option<Arc<Vec<u8>>>,
+    /// AppUserModelID / nama exe aplikasi pemutar (mis. "Spotify.exe", "MSEdge").
+    pub source: String,
 }
 
 impl Default for MediaInfo {
@@ -43,6 +45,7 @@ impl Default for MediaInfo {
             pos_ms: 0,
             stamp: Instant::now(),
             thumb: None,
+            source: String::new(),
         }
     }
 }
@@ -52,6 +55,7 @@ impl PartialEq for MediaInfo {
         self.active == o.active
             && self.playing == o.playing
             && self.key == o.key
+            && self.source == o.source
             && self.duration_ms == o.duration_ms
             && self.pos_ms == o.pos_ms
             && match (&self.thumb, &o.thumb) {
@@ -176,7 +180,8 @@ fn read(session: &GlobalSystemMediaTransportControlsSession) -> windows::core::R
         }
     };
 
-    Ok(MediaInfo { active: true, playing, title, artist, key, duration_ms, pos_ms, stamp: Instant::now(), thumb })
+    let source = session.SourceAppUserModelId().map(|s| s.to_string()).unwrap_or_default();
+    Ok(MediaInfo { active: true, playing, title, artist, key, duration_ms, pos_ms, stamp: Instant::now(), thumb, source })
 }
 
 fn refresh_session(session: &GlobalSystemMediaTransportControlsSession) {

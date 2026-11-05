@@ -334,3 +334,26 @@ pub fn delete_profile(name: &str) {
         }
     }
 }
+thread_local! {
+    /// Meter puncak suara perangkat output default (dibuat lazim di thread pemanggil, diperbarui tiap ~10 dtk
+    /// agar ikut berganti saat perangkat output berganti).
+    static METER: std::cell::RefCell<Option<(std::time::Instant, IAudioMeterInformation)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Puncak suara yang sedang diputar komputer, 0.0..1.0 (0 bila tidak ada/gagal).
+pub fn audio_peak() -> f32 {
+    METER.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.as_ref().map(|(t, _)| t.elapsed().as_secs() >= 10).unwrap_or(true) {
+            *m = unsafe {
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                    .and_then(|e| e.GetDefaultAudioEndpoint(eRender, eConsole))
+                    .and_then(|d| d.Activate::<IAudioMeterInformation>(CLSCTX_ALL, None))
+                    .ok()
+                    .map(|meter| (std::time::Instant::now(), meter))
+            };
+        }
+        m.as_ref().and_then(|(_, meter)| unsafe { meter.GetPeakValue() }.ok()).unwrap_or(0.0).clamp(0.0, 1.0)
+    })
+}

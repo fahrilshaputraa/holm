@@ -3,6 +3,8 @@
 mod bar;
 mod canvas;
 mod config;
+mod weather;
+mod idle;
 mod control;
 mod dock;
 mod icons;
@@ -22,7 +24,7 @@ mod tray;
 
 use canvas::wide;
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -47,6 +49,8 @@ const WM_FOREGROUND: u32 = WM_APP + 2;
 const WM_REBUILD: u32 = WM_APP + 10;
 /// Dikirim instance kedua ke jendela IPC: buka Pengaturan.
 const WM_OPEN_SETTINGS: u32 = WM_APP + 11;
+/// `holm-bar.exe --preview`: instance kedua meminta kartu contoh berikutnya di notch.
+const WM_PREVIEW: u32 = WM_APP + 13;
 const IPC_CLASS: PCWSTR = w!("HolmBarIpcClass");
 
 static MAIN_TID: AtomicU32 = AtomicU32::new(0);
@@ -73,7 +77,7 @@ fn docks() -> Vec<HWND> {
     WINDOWS.with(|w| w.borrow().docks.clone())
 }
 
-fn bars() -> Vec<HWND> {
+pub(crate) fn bars() -> Vec<HWND> {
     WINDOWS.with(|w| w.borrow().bars.clone())
 }
 
@@ -105,11 +109,28 @@ pub fn handle_command(id: usize) {
         IDM_OPEN_CONFIG => open_config(),
         IDM_RELOAD => reload_config(),
         IDM_PREVIEW_NOTIF => {
-            let t = notifications::Toast {
-                app: "HolmBar".into(),
-                title: "Contoh notifikasi".into(),
-                body: "Begini tampilan banner Windows di notch.".into(),
-                icon: None,
+            // Tiap klik menampilkan jenis kartu berikutnya: pesan, panggilan, Bluetooth, mengisi daya.
+            static N: AtomicUsize = AtomicUsize::new(0);
+            use notifications::{Kind, Toast};
+            let t = match N.fetch_add(1, Ordering::Relaxed) % 4 {
+                0 => Toast::message("WhatsApp", "STI & DDMS", "~ Ulfah: Sticker · 511 pesan belum dibaca"),
+                1 => {
+                    let mut t = Toast::message("WhatsApp", "Prince", "Panggilan suara masuk");
+                    t.actions = vec!["Tolak".into(), "Terima".into()];
+                    t.kind = Kind::Call;
+                    t
+                }
+                2 => {
+                    let mut t = Toast::message("Bluetooth", "AirBuds Pro", "");
+                    t.kind = Kind::Bluetooth { battery: Some(70), audio: true };
+                    t
+                }
+                _ => {
+                    let pct = bar::battery().map(|b| b.0).unwrap_or(70);
+                    let mut t = Toast::message("", "Mengisi daya", "Pengisi daya tersambung");
+                    t.kind = Kind::Charging { pct };
+                    t
+                }
             };
             notches().into_iter().for_each(|h| notch::notify(h, t.clone()));
         }
@@ -290,6 +311,7 @@ pub(crate) fn reload_config() {
         register_hotkey();
         start_notifications();
         tray::sync();
+        weather::set_city(&config::current().weather.city);
     }
     if let Ok(mut s) = CONFIG_STAMP.lock() {
         *s = config::mtime();
@@ -418,6 +440,10 @@ unsafe extern "system" fn bar_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
 
 /// Jendela pesan tersembunyi agar instance kedua bisa meminta jendela Pengaturan dibuka.
 unsafe extern "system" fn ipc_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_PREVIEW {
+        handle_command(IDM_PREVIEW_NOTIF);
+        return LRESULT(0);
+    }
     if msg == WM_OPEN_SETTINGS {
         settings::open();
         return LRESULT(0);
@@ -478,6 +504,7 @@ fn handle_thread_message(msg: &MSG) {
         }
         status::WM_STATUS_CHANGED => {
             bars().into_iter().for_each(bar::redraw);
+            notches().into_iter().for_each(notch::redraw); // cuaca untuk animasi idle
             popup::on_status_changed();
         }
         WM_FOREGROUND => {
@@ -491,7 +518,7 @@ fn handle_thread_message(msg: &MSG) {
             DOCK_PENDING.store(false, Ordering::SeqCst);
             dock::refresh(&docks(), None);
         }
-        notifications::WM_NOTIFY_TOAST => {
+        notifications::WM_NOTIFY_TOAST | radios::WM_BT_CONNECTED => {
             let t = unsafe { Box::from_raw(msg.lParam.0 as *mut notifications::Toast) };
             notches().into_iter().for_each(|h| notch::notify(h, (*t).clone()));
         }
@@ -515,7 +542,8 @@ fn main() {
             // Sudah berjalan: menjalankan HolmBar lagi membuka jendela Pengaturan.
             if let Ok(h) = FindWindowExW(Some(HWND_MESSAGE), None, IPC_CLASS, PCWSTR::null()) {
                 let _ = AllowSetForegroundWindow(ASFW_ANY);
-                let _ = PostMessageW(Some(h), WM_OPEN_SETTINGS, WPARAM(0), LPARAM(0));
+                let m = if std::env::args().any(|a| a == "--preview") { WM_PREVIEW } else { WM_OPEN_SETTINGS };
+                let _ = PostMessageW(Some(h), m, WPARAM(0), LPARAM(0));
             }
             return;
         }
@@ -539,11 +567,16 @@ fn main() {
         // DESTROY(0x8001)..HIDE(0x8003) dan CLOAKED(0x8017)..UNCLOAKED(0x8018)
         let _h2 = SetWinEventHook(0x8001, 0x8003, None, Some(dock_hook), 0, 0, WINEVENT_OUTOFCONTEXT);
         let _h3 = SetWinEventHook(0x8017, 0x8018, None, Some(dock_hook), 0, 0, WINEVENT_OUTOFCONTEXT);
+        // MOVESIZEEND (0x000B): jendela dipindah ke monitor lain -> Dock monitor itu diperbarui.
+        let _h4 = SetWinEventHook(0x000B, 0x000B, None, Some(dock_hook), 0, 0, WINEVENT_OUTOFCONTEXT);
         let tid = GetCurrentThreadId();
         register_hotkey();
         media::start(tid);
         status::start(tid);
         start_notifications();
+        radios::watch(tid);
+        weather::set_city(&config::current().weather.city);
+        weather::start(tid);
         tray::sync();
         if bar::on_foreground(GetForegroundWindow()) {
             bars().into_iter().for_each(bar::redraw);

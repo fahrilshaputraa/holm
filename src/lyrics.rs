@@ -67,7 +67,7 @@ pub fn request(key: u64, artist: &str, title: &str, duration_ms: u64) {
     std::thread::spawn(move || store(key, fetch(&artist, &title, duration_ms)));
 }
 
-fn encode(s: &str) -> String {
+pub fn encode(s: &str) -> String {
     let mut o = String::new();
     for b in s.bytes() {
         match b {
@@ -85,6 +85,11 @@ fn clean_title(t: &str) -> String {
 }
 
 fn http_get(path: &str) -> Option<(u32, Vec<u8>)> {
+    https_get("lrclib.net", path)
+}
+
+/// GET https://`host``path` lewat WinHTTP: (status, isi). Dipakai lirik dan cuaca.
+pub fn https_get(host_name: &str, path: &str) -> Option<(u32, Vec<u8>)> {
     let w = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
     unsafe {
         let agent = w("HolmBar/0.1");
@@ -93,7 +98,7 @@ fn http_get(path: &str) -> Option<(u32, Vec<u8>)> {
             return None;
         }
         let _ = WinHttpSetTimeouts(session, 5000, 5000, 8000, 8000);
-        let host = w("lrclib.net");
+        let host = w(host_name);
         let conn = WinHttpConnect(session, PCWSTR(host.as_ptr()), INTERNET_DEFAULT_HTTPS_PORT, 0);
         let mut result = None;
         if !conn.is_null() {

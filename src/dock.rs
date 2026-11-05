@@ -26,11 +26,11 @@ pub const WM_APPBAR_DOCK: u32 = WM_USER + 102;
 const TIMER_ANIM: usize = 1;
 const TIMER_POLL: usize = 2;
 const FRAME_MS: u32 = 16;
-const POLL_MS: u32 = 100;
+const POLL_MS: u32 = 40;
 /// Konstanta waktu peluruhan magnifikasi (detik); lebih kecil = lebih tajam.
 const MAG_TAU: f32 = 0.055;
 /// Durasi geser muncul/sembunyi (detik).
-const SLIDE_SECS: f32 = 0.28;
+const SLIDE_SECS: f32 = 0.2;
 const BOUNCE_MS: u128 = 1800;
 const BOUNCE_GIVEUP_MS: u128 = 8000;
 
@@ -54,6 +54,8 @@ struct Win {
     tracking: bool,
     /// Kotak ikon (x, y, w, h) hasil gambar terakhir, untuk hit-test.
     rects: Vec<(f32, f32, f32, f32)>,
+    /// Item Dock ini: pin + aplikasi yang jendelanya ada di monitor ini.
+    items: Vec<Item>,
     win_w: i32,
     win_h: i32,
     /// Kanvas dipakai ulang antar frame (membuat DIB + GDI+ tiap frame sangat mahal).
@@ -69,7 +71,6 @@ struct Win {
     shown: f32,
     want: bool,
     away_since: Option<Instant>,
-    near_since: Option<Instant>,
 }
 
 thread_local! {
@@ -93,6 +94,7 @@ pub fn attach(hwnd: HWND, mon: Mon) {
                 cur: Vec::new(),
                 tracking: false,
                 rects: Vec::new(),
+                items: Vec::new(),
                 win_w: 0,
                 win_h: 0,
                 canvas: None,
@@ -104,7 +106,6 @@ pub fn attach(hwnd: HWND, mon: Mon) {
                 shown: 1.0,
                 want: true,
                 away_since: None,
-                near_since: None,
             },
         );
     });
@@ -707,7 +708,7 @@ pub fn redraw(hwnd: HWND) {
 }
 
 fn redraw_inner(hwnd: HWND) {
-    let items = ITEMS.with(|i| i.borrow().clone());
+    let items = dock_items(hwnd);
     let Some(mon) = with(hwnd, |w| w.mon) else { return };
     let n = items.len();
     let g = geo(n, &mon);
@@ -839,7 +840,7 @@ thread_local! {
 pub fn layout(hwnd: HWND) {
     let cfg = config::current();
     let Some(mon) = with(hwnd, |w| w.mon) else { return };
-    let n = ITEMS.with(|i| i.borrow().len());
+    let n = dock_len(hwnd);
     let g = geo(n, &mon);
     // Taskbar asli yang disembunyikan masih menyisakan ruangnya; Dock menempel di tepi bawah layar
     // dan appbar-nya hanya menambah selisihnya, agar tidak ada celah kosong di bawah Dock.
@@ -902,13 +903,33 @@ pub fn refresh(docks: &[HWND], fg: Option<HWND>) {
         let _ = std::fs::write(config::dir().join("dock-items.txt"), lines.join("
 "));
     }
-    let changed = ITEMS.with(|i| {
-        let mut i = i.borrow_mut();
-        let c = *i != new_items;
-        *i = new_items;
-        c
-    });
+    ITEMS.with(|i| *i.borrow_mut() = new_items.clone());
+    // Tiap Dock hanya menampilkan jendela yang berada di monitornya (seperti taskbar Windows:
+    // "tampilkan aplikasi di taskbar tempat jendelanya terbuka"). Pin hanya di Dock monitor utama.
+    let split = docks.len() > 1;
+    let mut origin: HashMap<isize, (i32, i32)> = HashMap::new();
     for &d in docks {
+        let Some(mon) = with(d, |w| w.mon) else { continue };
+        let mine: Vec<Item> = if !split {
+            new_items.clone()
+        } else {
+            new_items
+                .iter()
+                .filter_map(|it| {
+                    let mut it = it.clone();
+                    it.windows.retain(|&h| *origin.entry(h).or_insert_with(|| window_monitor(HWND(h as *mut _))) == (mon.x, mon.y));
+                    // Pin hanya di Dock monitor utama; monitor lain = tombol Windows + jendela di monitor itu.
+                    let keep = !it.windows.is_empty() || it.key == START_KEY || (mon.primary && it.pinned);
+                    keep.then_some(it)
+                })
+                .collect()
+        };
+        let changed = with(d, |w| {
+            let c = w.items != mine;
+            w.items = mine;
+            c
+        })
+        .unwrap_or(false);
         if changed {
             layout(d);
         } else if active_changed {
@@ -917,6 +938,29 @@ pub fn refresh(docks: &[HWND], fg: Option<HWND>) {
         ensure_timer(d);
         ensure_poll(d);
     }
+}
+
+/// Sudut kiri-atas monitor tempat jendela berada (jendela yang diminimize: posisi sebelum diminimize).
+fn window_monitor(h: HWND) -> (i32, i32) {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    unsafe {
+        let m = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(m, &mut info).as_bool() {
+            (info.rcMonitor.left, info.rcMonitor.top)
+        } else {
+            (0, 0)
+        }
+    }
+}
+
+/// Daftar item Dock ini (sudah dipisah per monitor).
+fn dock_items(hwnd: HWND) -> Vec<Item> {
+    with(hwnd, |w| w.items.clone()).unwrap_or_default()
+}
+
+fn dock_len(hwnd: HWND) -> usize {
+    with(hwnd, |w| w.items.len()).unwrap_or(0)
 }
 
 fn animating(hwnd: HWND) -> bool {
@@ -1017,7 +1061,7 @@ fn ensure_poll(hwnd: HWND) {
 
 /// Kotak pill Dock dalam koordinat layar (tidak bergantung pada posisi geser saat ini).
 fn pill_rect(hwnd: HWND) -> Option<(f32, f32, f32, f32)> {
-    let (mon, n) = (with(hwnd, |w| w.mon)?, ITEMS.with(|i| i.borrow().len()));
+    let (mon, n) = (with(hwnd, |w| w.mon)?, dock_len(hwnd));
     let g = geo(n, &mon);
     let base = n.max(1) as f32 * g.icon + (n.max(1) as f32 - 1.0) * g.gap + 2.0 * g.pad;
     let bottom = DOCK_BOTTOM.with(|b| b.borrow().get(&(hwnd.0 as isize)).copied()).unwrap_or(mon.y + mon.h) as f32 - 6.0 - 4.0 * g.s;
@@ -1030,7 +1074,7 @@ fn overlapped(hwnd: HWND) -> bool {
     let s = with(hwnd, |w| w.mon.scale).unwrap_or(1.0);
     let inset = 3.0 * s;
     let (l, t, r, b) = (px, py + inset, px + pw, py + ph);
-    let items = ITEMS.with(|i| i.borrow().clone());
+    let items = dock_items(hwnd);
     for it in items.iter().filter(|i| i.key != START_KEY) {
         for &h in &it.windows {
             let hw = HWND(h as *mut _);
@@ -1051,8 +1095,24 @@ fn overlapped(hwnd: HWND) -> bool {
     false
 }
 
+thread_local! {
+    /// Hitungan tick polling: pekerjaan mahal (penegakan taskbar, cek jendela menutupi) tidak tiap tick.
+    static POLL_N: Cell<u32> = const { Cell::new(0) };
+    static OVERLAP: RefCell<HashMap<isize, bool>> = RefCell::new(HashMap::new());
+}
+
 fn poll(hwnd: HWND) {
-    crate::taskbar::enforce();
+    let n = POLL_N.with(|c| {
+        let v = c.get().wrapping_add(1);
+        c.set(v);
+        v
+    });
+    if n % 25 == 0 {
+        // Jendela bisa dipindah antar monitor tanpa event yang kita pantau (mis. Win+Shift+Panah).
+        unsafe {
+            let _ = PostThreadMessageW(GetCurrentThreadId(), WM_DOCK_REFRESH, WPARAM(0), LPARAM(0));
+        }
+    }
     let cfg = config::current();
     let mode = cfg.dock.autohide.as_str();
     if mode == "off" {
@@ -1066,20 +1126,39 @@ fn poll(hwnd: HWND) {
     let Some(mon) = with(hwnd, |w| w.mon) else { return };
     let s = mon.scale;
     let on_mon = pt.x >= mon.x && pt.x < mon.x + mon.w && pt.y >= mon.y && pt.y < mon.y + mon.h;
-    let at_edge = on_mon && pt.y >= mon.y + mon.h - (2.0 * s).ceil() as i32;
-    let near_dock = pill_rect(hwnd).map(|(px, py, pw, ph)| {
-        let m = 18.0 * s;
-        let (x, y) = (pt.x as f32, pt.y as f32);
-        x >= px - m && x <= px + pw + m && y >= py - 40.0 * s && y <= py + ph + m + 8.0 * s
-    }).unwrap_or(false);
+    // Tepi bawah: beberapa piksel terakhir layar (kursor berhenti di baris terakhir).
+    let at_edge = on_mon && pt.y >= mon.y + mon.h - (3.0 * s).ceil().max(2.0) as i32;
+    // Kursor di tepi bawah memancing taskbar Windows (auto-hide) muncul: sembunyikan seketika (daftar taskbar di-cache, murah).
+    {
+        crate::taskbar::enforce();
+    }
+    let near_dock = on_mon
+        && pill_rect(hwnd)
+            .map(|(px, py, pw, ph)| {
+                let m = 18.0 * s;
+                let (x, y) = (pt.x as f32, pt.y as f32);
+                x >= px - m && x <= px + pw + m && y >= py - 48.0 * s && y <= py + ph + 40.0 * s
+            })
+            .unwrap_or(false);
     let busy = crate::menu::is_open() || with(hwnd, |w| w.tracking && w.mouse_x.is_some()).unwrap_or(false);
-    let overlap = mode == "always" || overlapped(hwnd);
+    // Cek jendela yang menutupi Dock cukup ~5x per detik.
+    let key = hwnd.0 as isize;
+    let overlap = if mode == "always" {
+        true
+    } else if n % 4 == 0 || OVERLAP.with(|o| !o.borrow().contains_key(&key)) {
+        let v = overlapped(hwnd);
+        OVERLAP.with(|o| o.borrow_mut().insert(key, v));
+        v
+    } else {
+        OVERLAP.with(|o| o.borrow().get(&key).copied().unwrap_or(false))
+    };
     let delay = std::time::Duration::from_millis(cfg.dock.autohide_delay_ms as u64);
 
     let changed = with(hwnd, |w| {
         let before = w.want;
         if w.want {
-            if near_dock || busy || !overlap {
+            // Tetap tampil selama kursor di Dock atau masih menempel di tepi bawah.
+            if near_dock || at_edge || busy || !overlap {
                 w.away_since = None;
             } else {
                 let since = *w.away_since.get_or_insert_with(Instant::now);
@@ -1088,20 +1167,10 @@ fn poll(hwnd: HWND) {
                     w.away_since = None;
                 }
             }
-            w.near_since = None;
         } else {
             w.away_since = None;
-            if at_edge && on_mon {
-                let since = *w.near_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= std::time::Duration::from_millis(120) {
-                    w.want = true;
-                    w.near_since = None;
-                }
-            } else {
-                w.near_since = None;
-                if !overlap {
-                    w.want = true; // tidak ada yang menutupi: tampilkan lagi
-                }
+            if at_edge || !overlap {
+                w.want = true; // langsung muncul begitu kursor menyentuh tepi bawah
             }
         }
         w.want != before
@@ -1271,7 +1340,7 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         WM_LBUTTONUP => {
             let (x, y) = xy(lparam);
             if let Some(i) = item_at(hwnd, x, y) {
-                if let Some(it) = ITEMS.with(|v| v.borrow().get(i).cloned()) {
+                if let Some(it) = dock_items(hwnd).get(i).cloned() {
                     if it.key == START_KEY {
                         crate::popup::open_launcher();
                     } else if it.windows.is_empty() {
@@ -1286,7 +1355,7 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         }
         WM_RBUTTONUP => {
             let (x, y) = xy(lparam);
-            match item_at(hwnd, x, y).and_then(|i| ITEMS.with(|v| v.borrow().get(i).cloned())) {
+            match item_at(hwnd, x, y).and_then(|i| dock_items(hwnd).get(i).cloned()) {
                 Some(it) if it.key == START_KEY => {
                     let mut pt = POINT::default();
                     unsafe {
@@ -1325,4 +1394,28 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+
+/// Nama + ikon aplikasi pemutar media dari AppUserModelID SMTC
+/// (mis. "Spotify.exe", "MSEdge", "Chrome", "Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic").
+pub fn source_app(src: &str) -> Option<(String, Image)> {
+    let l = src.trim().to_lowercase();
+    if l.is_empty() {
+        return None;
+    }
+    let stem = l.rsplit(['\\', '/']).next().unwrap_or("").trim_end_matches(".exe").to_string();
+    let items = ITEMS.with(|i| i.borrow().clone());
+    let stem_of = |p: &str| std::path::Path::new(p).file_stem().map(|s| s.to_string_lossy().to_lowercase());
+    if let Some(it) = items.iter().find(|it| it.key != START_KEY && (it.aumid == l || (!stem.is_empty() && stem_of(&it.path).as_deref() == Some(stem.as_str())))) {
+        if let Some(img) = load_icon(it) {
+            return Some((it.name.clone(), img.resized(64).unwrap_or(img)));
+        }
+    }
+    if l.contains('!') {
+        let img = appsfolder_icon(src.trim())?;
+        let name = appsfolder_name(src.trim()).unwrap_or_else(|| pretty_name(&stem));
+        return Some((name, img.resized(64).unwrap_or(img)));
+    }
+    let img = crate::popup::app_icon(&stem)?;
+    Some((pretty_name(&stem), img))
 }

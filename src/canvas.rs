@@ -1,10 +1,16 @@
-//! Pembungkus tipis GDI+ untuk jendela layered per-pixel alpha.
-//! Menggambar langsung ke memori DIB (format PARGB) tanpa salinan.
+//! Pembungkus tipis GDI+ (bentuk/gambar) + DirectWrite (teks) untuk jendela layered per-pixel alpha.
+//! Menggambar langsung ke memori DIB (format PARGB) tanpa salinan; kanvas dan font di-cache.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Direct2D::Common::*;
+use windows::Win32::Graphics::Direct2D::*;
+use windows::Win32::Graphics::DirectWrite::*;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Graphics::GdiPlus::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -192,36 +198,123 @@ impl Drop for Image {
     }
 }
 
+// ---------- Teks: DirectWrite (lebih tajam dari GDI+, ber-hinting, tanpa jarak huruf aneh) ----------
+
+thread_local! {
+    static DWRITE: RefCell<Option<IDWriteFactory>> = const { RefCell::new(None) };
+    static D2D: RefCell<Option<ID2D1Factory>> = const { RefCell::new(None) };
+    /// Format teks per (font, ukuran, tebal): membuat format/menelusuri font tiap frame sangat mahal.
+    static FONTS: RefCell<HashMap<(String, i32, bool), Font>> = RefCell::new(HashMap::new());
+    /// Kanvas bekas dipakai ulang (membuat DIB + konteks GDI+ tiap frame mahal dan membuat UI tersendat).
+    static POOL: RefCell<Vec<Inner>> = const { RefCell::new(Vec::new()) };
+}
+
+fn dwrite() -> Option<IDWriteFactory> {
+    DWRITE.with(|d| {
+        let mut d = d.borrow_mut();
+        if d.is_none() {
+            *d = unsafe { DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED) }.ok();
+        }
+        d.clone()
+    })
+}
+
+fn d2d() -> Option<ID2D1Factory> {
+    D2D.with(|d| {
+        let mut d = d.borrow_mut();
+        if d.is_none() {
+            *d = unsafe { D2D1CreateFactory::<ID2D1Factory>(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }.ok();
+        }
+        d.clone()
+    })
+}
+
+#[derive(Clone)]
 pub struct Font {
-    family: *mut GpFontFamily,
-    font: *mut GpFont,
+    fmt: Option<IDWriteTextFormat>,
+    trim: Option<IDWriteInlineObject>,
+    px: f32,
 }
 
 impl Font {
+    /// Font (di-cache). `bold` memakai Semibold (600) seperti teks tebal macOS.
     pub fn new(name: &str, px: f32, bold: bool) -> Font {
-        unsafe {
-            let mut family: *mut GpFontFamily = null_mut();
-            for candidate in [name, "Segoe UI Symbol", "Segoe UI"] {
-                let w = wide(candidate);
-                family = null_mut();
-                let st = GdipCreateFontFamilyFromName(PCWSTR(w.as_ptr()), null_mut(), &mut family);
-                if st.0 == 0 && !family.is_null() {
-                    break;
-                }
+        let key = (name.to_string(), (px * 16.0).round() as i32, bold);
+        if let Some(f) = FONTS.with(|c| c.borrow().get(&key).cloned()) {
+            return f;
+        }
+        let f = Self::create(name, px, bold);
+        FONTS.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.len() > 400 {
+                c.clear();
             }
-            let mut font: *mut GpFont = null_mut();
-            let style = if bold { FontStyleBold.0 } else { FontStyleRegular.0 };
-            GdipCreateFont(family, px, style, UnitPixel, &mut font);
-            Font { family, font }
+            c.insert(key, f.clone());
+        });
+        f
+    }
+
+    fn create(name: &str, px: f32, bold: bool) -> Font {
+        let Some(fac) = dwrite() else { return Font { fmt: None, trim: None, px } };
+        unsafe {
+            let fam = wide(name);
+            let loc = wide("en-us");
+            let weight = if bold { DWRITE_FONT_WEIGHT_SEMI_BOLD } else { DWRITE_FONT_WEIGHT_NORMAL };
+            let fmt = fac.CreateTextFormat(PCWSTR(fam.as_ptr()), None, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, px.max(1.0), PCWSTR(loc.as_ptr())).ok();
+            let mut trim = None;
+            if let Some(f) = &fmt {
+                let _ = f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+                let _ = f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                trim = fac.CreateEllipsisTrimmingSign(f).ok();
+                let t = DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 };
+                let _ = f.SetTrimming(&t, trim.as_ref());
+            }
+            Font { fmt, trim, px }
+        }
+    }
+
+    /// Tata letak satu teks pada kotak lebar `w`, tinggi `h`.
+    fn layout(&self, s: &str, w: f32, h: f32, align: Align, wrap: bool) -> Option<IDWriteTextLayout> {
+        let fmt = self.fmt.as_ref()?;
+        let ws: Vec<u16> = s.encode_utf16().collect();
+        unsafe {
+            let l = dwrite()?.CreateTextLayout(&ws, fmt, w.max(1.0), h.max(1.0)).ok()?;
+            let _ = l.SetTextAlignment(match align {
+                Align::Near => DWRITE_TEXT_ALIGNMENT_LEADING,
+                Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
+                Align::Far => DWRITE_TEXT_ALIGNMENT_TRAILING,
+            });
+            if wrap {
+                let _ = l.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+                let _ = l.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+                // Baris terakhir yang muat diberi elipsis.
+                let t = DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_WORD, delimiter: 0, delimiterCount: 0 };
+                let _ = l.SetTrimming(&t, self.trim.as_ref());
+            }
+            Some(l)
         }
     }
 }
 
-impl Drop for Font {
-    fn drop(&mut self) {
+struct Inner {
+    hdc_mem: HDC,
+    hbmp: HBITMAP,
+    old: HGDIOBJ,
+    bitmap: *mut GpBitmap,
+    gfx: *mut GpGraphics,
+    w: i32,
+    h: i32,
+    rt: RefCell<Option<(ID2D1DCRenderTarget, ID2D1SolidColorBrush)>>,
+}
+
+impl Inner {
+    fn free(self) {
         unsafe {
-            GdipDeleteFont(self.font);
-            GdipDeleteFontFamily(self.family);
+            GdipDeleteGraphics(self.gfx);
+            GdipDisposeImage(self.bitmap as *mut GpImage);
+            SelectObject(self.hdc_mem, self.old);
+            let _ = DeleteObject(self.hbmp.into());
+            let _ = DeleteDC(self.hdc_mem);
         }
     }
 }
@@ -229,10 +322,9 @@ impl Drop for Font {
 pub struct Canvas {
     hdc_screen: HDC,
     hdc_mem: HDC,
-    hbmp: HBITMAP,
-    old: HGDIOBJ,
-    bitmap: *mut GpBitmap,
     gfx: *mut GpGraphics,
+    inner: Option<Inner>,
+    clip: Cell<Option<(f32, f32, f32, f32)>>,
     pub w: i32,
     pub h: i32,
 }
@@ -242,9 +334,29 @@ impl Canvas {
         if w <= 0 || h <= 0 {
             return None;
         }
+        let inner = POOL.with(|p| {
+            let mut p = p.borrow_mut();
+            p.iter().position(|i| i.w == w && i.h == h).map(|i| p.swap_remove(i))
+        });
+        let inner = match inner {
+            Some(i) => {
+                unsafe {
+                    GdipResetClip(i.gfx);
+                    GdipGraphicsClear(i.gfx, 0);
+                }
+                i
+            }
+            None => Self::alloc(w, h)?,
+        };
+        let hdc_screen = unsafe { GetDC(None) };
+        Some(Canvas { hdc_screen, hdc_mem: inner.hdc_mem, gfx: inner.gfx, inner: Some(inner), clip: Cell::new(None), w, h })
+    }
+
+    fn alloc(w: i32, h: i32) -> Option<Inner> {
         unsafe {
             let hdc_screen = GetDC(None);
             let hdc_mem = CreateCompatibleDC(Some(hdc_screen));
+            ReleaseDC(None, hdc_screen);
             let bmi = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
                     biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -262,7 +374,6 @@ impl Canvas {
                 std::result::Result::Ok(b) => b,
                 Err(_) => {
                     let _ = DeleteDC(hdc_mem);
-                    ReleaseDC(None, hdc_screen);
                     return None;
                 }
             };
@@ -274,10 +385,35 @@ impl Canvas {
             let mut gfx: *mut GpGraphics = null_mut();
             GdipGetImageGraphicsContext(bitmap as *mut GpImage, &mut gfx);
             GdipSetSmoothingMode(gfx, SmoothingModeAntiAlias);
-            GdipSetTextRenderingHint(gfx, TextRenderingHintAntiAlias); // tanpa grid-fit: jarak huruf benar di DPI pecahan
+            GdipSetTextRenderingHint(gfx, TextRenderingHintAntiAliasGridFit);
 
-            Some(Canvas { hdc_screen, hdc_mem, hbmp, old, bitmap, gfx, w, h })
+            Some(Inner { hdc_mem, hbmp, old, bitmap, gfx, w, h, rt: RefCell::new(None) })
         }
+    }
+
+    /// Render target Direct2D yang menggambar ke DIB yang sama (dibuat sekali per kanvas).
+    fn rt(&self) -> Option<(ID2D1DCRenderTarget, ID2D1SolidColorBrush)> {
+        let inner = self.inner.as_ref()?;
+        if inner.rt.borrow().is_none() {
+            unsafe {
+                let props = D2D1_RENDER_TARGET_PROPERTIES {
+                    r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+                    pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                    dpiX: 96.0,
+                    dpiY: 96.0,
+                    usage: D2D1_RENDER_TARGET_USAGE_NONE,
+                    minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+                };
+                let rt = d2d()?.CreateDCRenderTarget(&props).ok()?;
+                rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+                if let Some(p) = dwrite().and_then(|f| f.CreateCustomRenderingParams(1.8, 0.6, 0.0, DWRITE_PIXEL_GEOMETRY_FLAT, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC).ok()) {
+                    rt.SetTextRenderingParams(&p);
+                }
+                let brush = rt.CreateSolidColorBrush(&D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }, None).ok()?;
+                *inner.rt.borrow_mut() = Some((rt, brush));
+            }
+        }
+        inner.rt.borrow().clone()
     }
 
     fn brush(&self, color: u32) -> *mut GpSolidFill {
@@ -379,14 +515,60 @@ impl Canvas {
 
     /// Batasi gambar berikutnya ke kotak ini (sampai `reset_clip`).
     pub fn clip(&self, x: f32, y: f32, w: f32, h: f32) {
+        self.clip.set(Some((x, y, w, h)));
         unsafe {
             GdipSetClipRect(self.gfx, x, y, w, h, CombineModeReplace);
         }
     }
 
     pub fn reset_clip(&self) {
+        self.clip.set(None);
         unsafe {
             GdipResetClip(self.gfx);
+        }
+    }
+
+    /// Persegi membulat berisi gradien linear `c0` -> `c1` (mendatar atau tegak).
+    #[allow(dead_code)]
+    pub fn fill_gradient(&self, x: f32, y: f32, w: f32, h: f32, r: (f32, f32, f32, f32), c0: u32, c1: u32, horizontal: bool) {
+        unsafe {
+            let rect = RectF { X: x - 0.5, Y: y - 0.5, Width: w + 1.0, Height: h + 1.0 };
+            let mut b: *mut GpLineGradient = null_mut();
+            let mode = if horizontal { LinearGradientModeHorizontal } else { LinearGradientModeVertical };
+            GdipCreateLineBrushFromRect(&rect, c0, c1, mode, WrapModeTileFlipXY, &mut b);
+            let p = Self::rr_path(x, y, w, h, r);
+            GdipFillPath(self.gfx, b as *mut _, p);
+            GdipDeletePath(p);
+            GdipDeleteBrush(b as *mut _);
+        }
+    }
+
+    /// Garis bersambung berujung dan bersudut bulat melalui titik-titik `pts`.
+    pub fn polyline(&self, pts: &[(f32, f32)], width: f32, color: u32) {
+        if pts.len() < 2 {
+            return;
+        }
+        let p: Vec<PointF> = pts.iter().map(|&(x, y)| PointF { X: x, Y: y }).collect();
+        unsafe {
+            let mut pen: *mut GpPen = null_mut();
+            GdipCreatePen1(color, width, UnitPixel, &mut pen);
+            GdipSetPenStartCap(pen, LineCapRound);
+            GdipSetPenEndCap(pen, LineCapRound);
+            GdipSetPenLineJoin(pen, LineJoinRound);
+            GdipDrawLines(self.gfx, pen, p.as_ptr(), p.len() as i32);
+            GdipDeletePen(pen);
+        }
+    }
+
+    /// Garis tebal berujung bulat.
+    pub fn line(&self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, color: u32) {
+        unsafe {
+            let mut pen: *mut GpPen = null_mut();
+            GdipCreatePen1(color, width, UnitPixel, &mut pen);
+            GdipSetPenStartCap(pen, LineCapRound);
+            GdipSetPenEndCap(pen, LineCapRound);
+            GdipDrawLine(self.gfx, pen, x0, y0, x1, y1);
+            GdipDeletePen(pen);
         }
     }
 
@@ -457,71 +639,76 @@ impl Canvas {
         }
     }
 
-    fn format(align: Align) -> *mut GpStringFormat {
-        let mut f: *mut GpStringFormat = null_mut();
-        unsafe {
-            GdipCreateStringFormat(0, 0, &mut f);
-            // NoWrap | NoClip
-            GdipSetStringFormatFlags(f, 0x1000 | 0x4000);
-            GdipSetStringFormatTrimming(f, StringTrimmingEllipsisCharacter);
-            GdipSetStringFormatLineAlign(f, StringAlignmentCenter);
-            let a = match align {
-                Align::Near => StringAlignmentNear,
-                Align::Center => StringAlignmentCenter,
-                Align::Far => StringAlignmentFar,
-            };
-            GdipSetStringFormatAlign(f, a);
-        }
-        f
-    }
-
-    /// Teks pada kotak (x, y, w, h), rata vertikal tengah.
+    /// Teks pada kotak (x, y, w, h), rata vertikal tengah, satu baris dengan elipsis.
     pub fn text(&self, s: &str, font: &Font, rect: (f32, f32, f32, f32), color: u32, align: Align) {
-        if s.is_empty() {
+        if s.is_empty() || color >> 24 == 0 {
             return;
         }
-        let ws = wide(s);
-        let r = RectF { X: rect.0, Y: rect.1, Width: rect.2, Height: rect.3 };
+        if let Some(l) = font.layout(s, rect.2, rect.3, align, false) {
+            self.draw_layout(&l, font, rect, color);
+        }
+    }
+
+    #[allow(dead_code)]
+    /// Teks beberapa baris (dibungkus per kata) mulai dari atas kotak; baris terakhir diberi elipsis.
+    pub fn text_wrap(&self, s: &str, font: &Font, rect: (f32, f32, f32, f32), color: u32, align: Align) {
+        if s.is_empty() || color >> 24 == 0 {
+            return;
+        }
+        if let Some(l) = font.layout(s, rect.2, rect.3, align, true) {
+            self.draw_layout(&l, font, rect, color);
+        }
+    }
+
+    fn draw_layout(&self, l: &IDWriteTextLayout, font: &Font, rect: (f32, f32, f32, f32), color: u32) {
+        let Some((rt, brush)) = self.rt() else { return };
+        // Kotak yang di-bind sedikit lebih besar dari kotak teks (huruf boleh sedikit menjorok),
+        // dipotong ke kanvas dan ke clip aktif.
+        let m = (font.px * 0.45).max(2.0);
+        let (mut l0, mut t0, mut r0, mut b0) = (rect.0 - m, rect.1 - m, rect.0 + rect.2 + m, rect.1 + rect.3 + m);
+        if let Some((cx, cy, cw, ch)) = self.clip.get() {
+            l0 = l0.max(cx);
+            t0 = t0.max(cy);
+            r0 = r0.min(cx + cw);
+            b0 = b0.min(cy + ch);
+        }
+        let (bl, bt) = (l0.max(0.0).floor() as i32, t0.max(0.0).floor() as i32);
+        let (br, bb) = (r0.min(self.w as f32).ceil() as i32, b0.min(self.h as f32).ceil() as i32);
+        if br <= bl || bb <= bt {
+            return;
+        }
+        let a = (color >> 24) as f32 / 255.0;
+        let ch = |sh: u32| ((color >> sh) & 0xFF) as f32 / 255.0;
         unsafe {
-            let f = Self::format(align);
-            let b = self.brush(color);
-            GdipDrawString(self.gfx, PCWSTR(ws.as_ptr()), (ws.len() - 1) as i32, font.font, &r, f, b as *mut _);
-            GdipDeleteBrush(b as *mut _);
-            GdipDeleteStringFormat(f);
+            let _ = GdiFlush();
+            if rt.BindDC(self.hdc_mem, &RECT { left: bl, top: bt, right: br, bottom: bb }).is_err() {
+                return;
+            }
+            rt.BeginDraw();
+            brush.SetColor(&D2D1_COLOR_F { r: ch(16), g: ch(8), b: ch(0), a });
+            let origin = windows_numerics::Vector2 { X: rect.0 - bl as f32, Y: rect.1 - bt as f32 };
+            rt.DrawTextLayout(origin, l, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            let _ = rt.EndDraw(None, None);
         }
     }
 
     pub fn measure(&self, s: &str, font: &Font) -> f32 {
-        if s.is_empty() {
-            return 0.0;
-        }
-        let ws = wide(s);
-        let layout = RectF { X: 0.0, Y: 0.0, Width: 10000.0, Height: 200.0 };
-        let mut bounds = RectF::default();
-        unsafe {
-            let f = Self::format(Align::Near);
-            GdipMeasureString(
-                self.gfx,
-                PCWSTR(ws.as_ptr()),
-                (ws.len() - 1) as i32,
-                font.font,
-                &layout,
-                f,
-                &mut bounds,
-                null_mut(),
-                null_mut(),
-            );
-            GdipDeleteStringFormat(f);
-        }
-        bounds.Width
+        measure(s, font)
     }
 
     /// Tampilkan ke jendela layered. `pos` = posisi layar; None mempertahankan posisi saat ini.
     pub fn present(&self, hwnd: HWND, pos: Option<(i32, i32)>) {
+        self.present_size(hwnd, pos, self.w, self.h);
+    }
+
+    /// Seperti `present`, tetapi hanya sudut kiri-atas `w`×`h` dari kanvas (kanvas besar dipakai ulang
+    /// untuk jendela yang ukurannya berubah tiap frame, mis. notch saat beranimasi).
+    pub fn present_size(&self, hwnd: HWND, pos: Option<(i32, i32)>, w: i32, h: i32) {
         unsafe {
+            let _ = GdiFlush();
             let mut dst = pos.map(|(x, y)| POINT { x, y });
             let mut src = POINT { x: 0, y: 0 };
-            let mut size = SIZE { cx: self.w, cy: self.h };
+            let mut size = SIZE { cx: w.clamp(1, self.w), cy: h.clamp(1, self.h) };
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
                 BlendFlags: 0,
@@ -543,16 +730,44 @@ impl Canvas {
     }
 }
 
+/// Lebar teks satu baris (piksel) tanpa memerlukan kanvas.
+pub fn measure(s: &str, font: &Font) -> f32 {
+    if s.is_empty() {
+        return 0.0;
+    }
+    let Some(l) = font.layout(s, 100_000.0, 1000.0, Align::Near, false) else { return 0.0 };
+    let mut m = DWRITE_TEXT_METRICS::default();
+    unsafe {
+        if l.GetMetrics(&mut m).is_err() {
+            return 0.0;
+        }
+    }
+    m.widthIncludingTrailingWhitespace
+}
+
 impl Drop for Canvas {
     fn drop(&mut self) {
         unsafe {
-            GdipDeleteGraphics(self.gfx);
-            GdipDisposeImage(self.bitmap as *mut GpImage);
-            SelectObject(self.hdc_mem, self.old);
-            let _ = DeleteObject(self.hbmp.into());
-            let _ = DeleteDC(self.hdc_mem);
             ReleaseDC(None, self.hdc_screen);
+        }
+        if let Some(inner) = self.inner.take() {
+            // Simpan untuk dipakai ulang; kanvas besar (> 8 MB) atau kolam penuh dibebaskan.
+            let big = inner.w as i64 * inner.h as i64 * 4 > 8 << 20;
+            let spill = POOL.with(|p| {
+                let mut p = p.borrow_mut();
+                if big {
+                    return Some(inner);
+                }
+                p.push(inner);
+                if p.len() > 10 {
+                    Some(p.remove(0))
+                } else {
+                    None
+                }
+            });
+            if let Some(i) = spill {
+                i.free();
+            }
         }
     }
 }
-

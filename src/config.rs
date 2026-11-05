@@ -7,6 +7,12 @@ use std::time::SystemTime;
 const DEFAULT_TOML: &str = include_str!("default_config.toml");
 
 #[derive(Deserialize)]
+pub struct WeatherCfg {
+    /// Nama kota untuk cuaca (kosong = tidak ada data yang dikirim; animasi hujan jadi hiasan).
+    pub city: String,
+}
+
+#[derive(Deserialize)]
 pub struct Config {
     pub general: General,
     pub bar: Bar,
@@ -17,6 +23,7 @@ pub struct Config {
     pub notifications: Notifications,
     pub tray: Tray,
     pub control: Control,
+    pub weather: WeatherCfg,
 }
 
 #[derive(Deserialize)]
@@ -39,6 +46,8 @@ pub struct Notifications {
     pub enabled: bool,
     pub duration_ms: u32,
     pub show_body: bool,
+    /// Monitor yang menampilkan kartu notch: "primary" (bawaan, privasi) atau "all".
+    pub monitors: String,
     pub poll_ms: u32,
 }
 
@@ -103,6 +112,8 @@ pub struct Notch {
     pub background: String,
     pub accent: String,
     pub tint_from_artwork: bool,
+    /// Animasi notch saat idle: "off" | "sky" | "plant" | "pulse" | "stars" | "wave".
+    pub idle_animation: String,
     pub tabs: Vec<String>,
     pub default_tab: String,
     pub compact_left: Vec<String>,
@@ -184,7 +195,7 @@ pub fn update_pinned(add: Option<&str>, remove: impl Fn(&str) -> bool) -> Result
 fn migrate_text(text: &str) -> Option<String> {
     let mut doc = text.parse::<toml_edit::DocumentMut>().ok()?;
     let ver = doc.get("general").and_then(|g| g.get("config_version")).and_then(|v| v.as_integer()).unwrap_or(1);
-    if ver >= 6 {
+    if ver >= 7 {
         return None;
     }
     if ver < 2 {
@@ -217,7 +228,18 @@ fn migrate_text(text: &str) -> Option<String> {
     if doc.get("bar").and_then(|b| b.get("desktop_label")).and_then(|v| v.as_str()) == Some("Finder") {
         set_key(&mut doc, "bar", "desktop_label", "HolmBar".into()).ok()?;
     }
-    set_key(&mut doc, "general", "config_version", 6i64.into()).ok()?;
+    // v7: Dock tampil di semua monitor; notch terbuka lebih lebar (media + kalender + pintasan berdampingan).
+    if ver < 7 {
+        if doc.get("dock").and_then(|t| t.get("monitors")).and_then(|v| v.as_str()) == Some("primary") {
+            set_key(&mut doc, "dock", "monitors", "all".into()).ok()?;
+        }
+        for (k, was, new) in [("expanded_width", 480i64, 640i64), ("expanded_height", 132, 150)] {
+            if doc.get("notch").and_then(|t| t.get(k)).and_then(|v| v.as_integer()) == Some(was) {
+                set_key(&mut doc, "notch", k, new.into()).ok()?;
+            }
+        }
+    }
+    set_key(&mut doc, "general", "config_version", 7i64.into()).ok()?;
     let out = doc.to_string();
     validate(&out).ok()?;
     Some(out)
@@ -372,9 +394,25 @@ expanded_height = 232
         let out = migrate_text(old).expect("perlu migrasi");
         assert!(out.contains("compact_height = 28   # tinggi"), "{out}");
         assert!(out.contains("expanded_width = 500"), "nilai buatan pengguna tidak disentuh: {out}");
-        assert!(out.contains("expanded_height = 132"));
-        assert!(out.contains("config_version = 6"));
+        assert!(out.contains("expanded_height = 150"), "bawaan lama naik ke bawaan terbaru: {out}");
+        assert!(out.contains("config_version = 7"));
         assert!(migrate_text(&out).is_none(), "migrasi hanya sekali");
+    }
+
+    #[test]
+    fn migrates_dock_to_all_monitors() {
+        let old = "[general]
+config_version = 6
+
+[dock]
+monitors = \"primary\"   # m
+
+[notch]
+expanded_width = 520
+";
+        let out = migrate_text(old).expect("perlu migrasi");
+        assert!(out.contains("monitors = \"all\"   # m"), "{out}");
+        assert!(out.contains("expanded_width = 520"), "nilai buatan pengguna tidak disentuh: {out}");
     }
 
     #[test]

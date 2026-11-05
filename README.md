@@ -9,9 +9,11 @@ Taskbar Windows disembunyikan lalu dipulihkan saat aplikasi keluar.
 - Ikon tray aplikasi (Discord, OneDrive, dll.) pindah ke menu bar: sebagian langsung tampil (ikuti pilihan
   taskbar Windows, atau atur `[tray]`), sisanya di popup panah. Klik kiri/kanan diteruskan ke aplikasinya.
   HolmBar menjadi host `Shell_TrayWnd` tanpa menyuntik explorer; semua pesan tetap diteruskan ke Explorer.
-- Notch (bentuk notch atau pill): saat ringkas menampilkan item pilihan di kiri/kanan (sampul, visualizer,
+- Notch (bentuk notch atau pill): saat idle berwajah (mata berkedip + pendar); saat ringkas menampilkan item pilihan di kiri/kanan (sampul, visualizer,
   judul, timer, baterai, jam, tanggal, CPU); saat terbuka bertab Media (lirik tersinkron lrclib.net),
-  Kalender, Timer/Stopwatch, dan Sistem; plus banner notifikasi Windows.
+  Kalender, Timer/Stopwatch, dan Sistem (Beranda = media dengan badge aplikasi sumber + kalender mini + Timer);
+  kartu notifikasi Windows, panggilan masuk (Terima/Tolak diteruskan ke banner asli), perangkat Bluetooth
+  tersambung (dengan baterai), dan pengisi daya dicolokkan. `holm-bar.exe --preview` menampilkan contoh kartu.
 - Dock: aplikasi tersemat (termasuk pin taskbar) dan yang berjalan, magnifikasi gelombang realtime, tombol Windows.
   Sembunyi otomatis (`dock.autohide`: `smart` = sembunyi saat ada jendela menutupi, `always`, `off`); arahkan
   kursor ke tepi bawah layar untuk memunculkannya. Klik kanan ikon: *Keep in Dock* / *Remove from Dock*

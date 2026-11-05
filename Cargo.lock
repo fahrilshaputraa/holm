@@ -23,7 +23,9 @@ dependencies = [
  "toml",
  "toml_edit",
  "windows",
+ "windows-collections",
  "windows-core",
+ "windows-numerics",
 ]
 
 [[package]]

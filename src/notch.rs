@@ -11,7 +11,7 @@ use crate::icons::{self, Icon};
 use crate::lyrics::{self, Lyrics};
 use crate::media::{self, Command, MediaInfo};
 use crate::monitors::Mon;
-use crate::notifications::Toast;
+use crate::notifications::{Kind, Toast};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -32,6 +32,9 @@ const FRAME_MS: u32 = 16;
 
 const TIMER_COLOR: u32 = 0xFFFF9F0A;
 const DIM: u32 = 0xFF9E9EA8;
+const GREEN: u32 = 0xFF30D158;
+const RED: u32 = 0xFFFF453A;
+const CYAN: u32 = 0xFF5AC8FA;
 
 type Rect = (f32, f32, f32, f32);
 
@@ -61,7 +64,30 @@ impl Tab {
             Tab::System => Icon::Chart,
         }
     }
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Media => tr("Beranda", "Home"),
+            Tab::Calendar => tr("Kalender", "Calendar"),
+            Tab::Timer => "Timer",
+            Tab::System => tr("Sistem", "System"),
+        }
+    }
 }
+
+/// Teks sesuai bahasa config (`general.language`).
+fn tr(id: &'static str, en: &'static str) -> &'static str {
+    if config::current().general.language == "en" {
+        en
+    } else {
+        id
+    }
+}
+
+/// Glyph dari font ikon Windows (Segoe Fluent Icons, jatuh ke MDL2 Assets).
+const GLYPH_FONT: &str = "Segoe Fluent Icons";
+const G_PHONE: &str = "\u{E717}";
+const G_HANGUP: &str = "\u{E778}";
+const G_HEADPHONE: &str = "\u{E7F6}";
 
 /// Tab aktif dari config (urutan dipertahankan, duplikat & nama tak dikenal dibuang).
 fn tabs() -> Vec<Tab> {
@@ -149,6 +175,9 @@ enum Hit {
     ClockReset,
     Mode(bool),
     Preset(u32),
+    CallAccept,
+    CallDecline,
+    NotifClose,
 }
 
 // ---------- Timer / stopwatch (dibagi semua notch) ----------
@@ -356,6 +385,14 @@ struct State {
     sys_at: Option<Instant>,
     tick_ms: u32,
     born: Instant,
+    /// Kanvas dipakai ulang antar frame; hanya diperbesar bila notch melebihi ukurannya.
+    canvas: Option<Canvas>,
+    /// Notch ringkas sedang menampilkan wajah idle (mata berkedip), atau kartu panggilan (tombol berdenyut).
+    idle: bool,
+    /// Ikon + nama aplikasi sumber media, di-cache per AppUserModelID.
+    source: Option<(String, Option<(String, Image)>)>,
+    /// Tombol kartu notifikasi (hit-test saat kartu tampil).
+    notif_rects: Vec<(Rect, Hit)>,
 }
 
 fn with<R>(hwnd: HWND, f: impl FnOnce(&mut State) -> R) -> Option<R> {
@@ -364,8 +401,13 @@ fn with<R>(hwnd: HWND, f: impl FnOnce(&mut State) -> R) -> Option<R> {
 
 pub fn attach(hwnd: HWND, mon: Mon) {
     unsafe {
-        SetTimer(Some(hwnd), TIMER_Z, 400, None);
+        SetTimer(Some(hwnd), TIMER_Z, 150, None);
     }
+    CHARGING.with(|c| {
+        if c.get().is_none() {
+            c.set(crate::bar::battery().map(|b| b.1));
+        }
+    });
     let tab = Tab::parse(&config::current().notch.default_tab).filter(|t| tabs().contains(t)).unwrap_or(tabs()[0]);
     WINS.with(|w| {
         w.borrow_mut().insert(
@@ -395,6 +437,10 @@ pub fn attach(hwnd: HWND, mon: Mon) {
                 sys_at: None,
                 tick_ms: 0,
                 born: Instant::now(),
+                canvas: None,
+                idle: false,
+                source: None,
+                notif_rects: Vec::new(),
             },
         );
     });
@@ -428,12 +474,26 @@ fn is_settled_open(hwnd: HWND) -> bool {
 /// Pilih interval gambar ulang sesuai apa yang sedang bergerak; 0 = mati.
 fn sync_tick(hwnd: HWND) {
     let info = media::info();
-    let Some((open, tab, anim, cur)) = with(hwnd, |st| (st.target_open && st.x > 0.9, st.tab, st.v.abs() > 0.0 || st.nt > 0.0, st.tick_ms)) else { return };
+    let Some((open, tab, anim, cur, call, idle, born, battery)) = with(hwnd, |st| {
+        let call = st.n_target && st.notif.as_ref().map(|t| t.kind == Kind::Call).unwrap_or(false);
+        (st.target_open && st.x > 0.9, st.tab, st.v.abs() > 0.0 || (st.nt > 0.0 && !call), st.tick_ms, call, st.idle && st.x < 0.05 && st.nt < 0.01, st.born, st.sys.battery)
+    }) else {
+        return;
+    };
     let (running, alarm, active) = clock(|c| (c.running(), c.alarm(), c.active()));
     let mut want = u32::MAX;
     let mut need = |ms: u32| want = want.min(ms);
     if alarm {
         need(60);
+    }
+    if call {
+        need(33); // denyut tombol terima
+    }
+    if idle && crate::idle::enabled() {
+        let ms = crate::idle::next_tick_ms(born.elapsed().as_secs_f32(), battery);
+        if ms > 0 {
+            need(ms);
+        }
     }
     if open {
         match tab {
@@ -496,12 +556,25 @@ struct Ctx<'a> {
     rects: Vec<(Rect, Hit)>,
 }
 
+/// Varian optis Segoe UI Variable: "Display" untuk teks besar (>= 18 DIP), "Text" untuk teks kecil.
+fn face(base: &str, size: f32) -> String {
+    if size >= 18.0 && base.eq_ignore_ascii_case("Segoe UI Variable Text") {
+        "Segoe UI Variable Display".into()
+    } else {
+        base.to_string()
+    }
+}
+
 impl Ctx<'_> {
     fn a(&self, col: u32) -> u32 {
         config::with_alpha(col, self.fade * ((col >> 24) as f32 / 255.0))
     }
     fn text(&self, t: &str, r: Rect, size: f32, bold: bool, col: u32, al: Align) {
-        self.c.text(t, &Font::new(&self.font, size * self.s, bold), r, self.a(col), al);
+        self.c.text(t, &Font::new(&face(&self.font, size), size * self.s, bold), r, self.a(col), al);
+    }
+    /// Glyph font ikon Windows di tengah kotak `r`.
+    fn glyph(&self, g: &str, r: Rect, size: f32, col: u32) {
+        self.c.text(g, &Font::new(GLYPH_FONT, size * self.s, false), r, self.a(col), Align::Center);
     }
     /// Ikon filled berukuran `size` DIP di tengah kotak `r`.
     fn icon(&self, ic: Icon, r: Rect, size: f32, col: u32) {
@@ -550,60 +623,127 @@ fn lyric_line(info: &MediaInfo) -> Option<String> {
 }
 
 /// Tinggi isi tiap tab (sebelum dipusatkan vertikal).
-const CONTENT_H: f32 = 74.0;
+const CONTENT_H: f32 = 84.0;
 
-fn draw_media(x: &mut Ctx, art: Option<&Image>, info: &MediaInfo, bx: f32, bw: f32, y0: f32) -> Rect {
+/// Tab Beranda: media (sampul + badge aplikasi sumber + kontrol) | kalender mini | pintasan Timer.
+#[allow(clippy::too_many_arguments)]
+fn draw_media(x: &mut Ctx, art: Option<&Image>, source: Option<&(String, Image)>, info: &MediaInfo, bx: f32, bw: f32, y0: f32, has_cal: bool, has_timer: bool) -> Rect {
     let s = x.s;
-    let pad = 20.0 * s;
-    let art_s = 74.0 * s;
-    let (ax, ay) = (bx + pad, y0);
+    let pad = 18.0 * s;
+    let inner = bw - 2.0 * pad;
+    let tile_w = 92.0 * s;
+    let cal_w = 176.0 * s;
+    let media_w = inner - cal_w - tile_w;
+    let ax = bx + pad;
+    let media_end = ax + media_w - 14.0 * s;
+
+    // --- Media ---
+    let art_s = 76.0 * s;
     match art {
-        Some(img) => x.c.draw_image(img, ax, ay, art_s, art_s, 14.0 * s, x.fade),
+        Some(img) => x.c.draw_image(img, ax, y0, art_s, art_s, 14.0 * s, x.fade),
         None => {
-            x.round((ax, ay, art_s, art_s), 14.0, 0xFF26262B);
-            x.icon(Icon::Music, (ax, ay, art_s, art_s), 30.0, if info.active { x.tint } else { 0xFF55555F });
+            x.round((ax, y0, art_s, art_s), 14.0, 0xFF232328);
+            x.icon(Icon::Music, (ax, y0, art_s, art_s), 30.0, if info.active { x.tint } else { 0xFF55555F });
         }
     }
-    let rx = bx + bw - pad;
-    let tx = ax + art_s + 16.0 * s;
-    // Kontrol di kanan atas, sejajar judul.
-    let (cy, gap, d) = (y0 + 20.0 * s, 34.0 * s, 32.0 * s);
-    let ctrl = if info.active { 0xFFFFFFFF } else { 0xFF55555F };
-    let play_icon = if info.playing { Icon::Pause } else { Icon::Play };
-    x.button(rx - 2.0 * gap - d / 2.0 + 6.0 * s, cy, d, Icon::Prev, 16.0, ctrl, Hit::Prev);
-    x.button(rx - gap - d / 2.0 + 6.0 * s, cy, d + 4.0 * s, play_icon, 21.0, ctrl, Hit::Play);
-    x.button(rx - d / 2.0 + 6.0 * s, cy, d, Icon::Next, 16.0, ctrl, Hit::Next);
-    let text_w = (rx - 3.0 * gap - 8.0 * s - tx).max(40.0 * s);
-
+    // Badge aplikasi sumber di sudut kanan bawah sampul (seperti logo Apple Music/Spotify).
+    if let (true, Some((_, icon))) = (info.active, source) {
+        let b = 26.0 * s;
+        let (bxx, byy) = (ax + art_s - b + 6.0 * s, y0 + art_s - b + 6.0 * s);
+        x.round((bxx - 2.0 * s, byy - 2.0 * s, b + 4.0 * s, b + 4.0 * s), 9.0, x.bg | 0xFF00_0000);
+        x.c.draw_image(icon, bxx, byy, b, b, 7.0 * s, x.fade);
+    }
+    let tx = ax + art_s + 14.0 * s;
+    let tw = (media_end - tx).max(40.0 * s);
     let (title, artist) = if info.active {
-        (if info.title.is_empty() { "Tanpa judul".to_string() } else { info.title.clone() }, info.artist.clone())
+        (if info.title.is_empty() { tr("Tanpa judul", "Untitled").to_string() } else { info.title.clone() }, info.artist.clone())
     } else {
-        ("Tidak ada media".to_string(), "Putar musik untuk mengontrolnya di sini".to_string())
+        (tr("Tidak ada media", "Nothing playing").to_string(), tr("Putar musik untuk mengontrolnya", "Play something to control it here").to_string())
     };
-    x.text(&title, (tx, y0 + 2.0 * s, text_w, 21.0 * s), 15.0, true, 0xFFFFFFFF, Align::Near);
-    x.text(&artist, (tx, y0 + 23.0 * s, text_w, 17.0 * s), 12.5, false, DIM, Align::Near);
-    if let Some(line) = info.active.then(|| lyric_line(info)).flatten() {
-        x.text(&line, (tx, y0 + 42.0 * s, rx - tx, 17.0 * s), 12.5, false, 0xD0FFFFFF, Align::Near);
+    x.text(&title, (tx, y0 + 2.0 * s, tw, 20.0 * s), 15.0, true, 0xFFFFFFFF, Align::Near);
+    x.text(&artist, (tx, y0 + 22.0 * s, tw, 17.0 * s), 12.5, false, DIM, Align::Near);
+    if info.active {
+        match lyric_line(info) {
+            Some(line) => x.text(&line, (tx, y0 + 39.0 * s, tw, 16.0 * s), 12.0, false, 0xD8FFFFFF, Align::Near),
+            None => {
+                if let Some((name, _)) = source {
+                    x.text(&format!("{} {name}", tr("dari", "from")), (tx, y0 + 39.0 * s, tw, 16.0 * s), 11.5, false, x.tint, Align::Near);
+                }
+            }
+        }
     }
 
-    // Progres (klik untuk lompat).
+    // Kontrol di bawah teks, lalu progres di sebelahnya (klik untuk lompat).
+    let cy = y0 + art_s - 12.0 * s;
+    let ctrl = if info.active { 0xFFFFFFFF } else { 0xFF55555F };
+    let play_icon = if info.playing { Icon::Pause } else { Icon::Play };
+    x.button(tx + 11.0 * s, cy, 28.0 * s, Icon::Prev, 15.0, ctrl, Hit::Prev);
+    x.button(tx + 44.0 * s, cy, 32.0 * s, play_icon, 20.0, ctrl, Hit::Play);
+    x.button(tx + 77.0 * s, cy, 28.0 * s, Icon::Next, 15.0, ctrl, Hit::Next);
     let mut bar = (0.0, 0.0, 0.0, 0.0);
-    if info.active {
+    let bar_x = tx + 100.0 * s;
+    if info.active && media_end - bar_x > 60.0 * s {
         let pos = info.position_ms();
-        let ty = y0 + art_s - 7.0 * s;
-        let tw = 34.0 * s;
-        bar = (tx + tw + 6.0 * s, ty - 2.0 * s, rx - tx - 2.0 * tw - 12.0 * s, 4.0 * s);
+        let lw = 36.0 * s;
+        bar = (bar_x, cy - 2.0 * s, media_end - bar_x - lw - 6.0 * s, 4.0 * s);
         let (bx2, by, bw2, bh) = bar;
         x.round(bar, 2.0, 0x38FFFFFF);
         let frac = if info.duration_ms > 0 { (pos as f32 / info.duration_ms as f32).clamp(0.0, 1.0) } else { 0.0 };
         if frac > 0.0 {
             x.round((bx2, by, (bw2 * frac).max(bh), bh), 2.0, x.tint);
         }
-        x.text(&fmt_time(pos), (tx, ty - 8.0 * s, tw, 16.0 * s), 10.5, false, DIM, Align::Near);
         let right = if info.duration_ms > 0 { format!("-{}", fmt_time(info.duration_ms.saturating_sub(pos))) } else { "LIVE".into() };
-        x.text(&right, (rx - tw, ty - 8.0 * s, tw, 16.0 * s), 10.5, false, DIM, Align::Far);
+        x.text(&right, (media_end - lw, cy - 8.0 * s, lw, 16.0 * s), 10.5, false, DIM, Align::Far);
         x.hit((bx2 - 4.0 * s, by - 8.0 * s, bw2 + 8.0 * s, bh + 16.0 * s), Hit::Seek);
     }
+
+    // --- Pemisah ---
+    let div = |x: &Ctx, at: f32| x.c.fill_rect(at, y0 + 6.0 * s, 1.0 * s, CONTENT_H * s - 12.0 * s, x.a(0x1FFFFFFF));
+    let cal_x = ax + media_w;
+    div(x, cal_x - 8.0 * s);
+
+    // --- Kalender mini: bulan, 5 hari di sekitar hari ini, jam ---
+    let n = names();
+    let now = unsafe { GetLocalTime() };
+    let today = days_from_civil(now.wYear as i64, now.wMonth as u32, now.wDay as u32);
+    let cx0 = cal_x + 8.0 * s;
+    let cw = cal_w - 24.0 * s;
+    let month = &n.months[now.wMonth as usize - 1];
+    x.text(&month.chars().take(3).collect::<String>(), (cx0, y0, cw, 20.0 * s), 15.0, true, 0xFFFFFFFF, Align::Near);
+    x.text(n.days_long[weekday(today)], (cx0, y0, cw, 20.0 * s), 11.5, false, x.tint, Align::Far);
+    let col = cw / 5.0;
+    for i in 0..5 {
+        let day = today - 2 + i as i64;
+        let (_, _, d) = civil_from_days(day);
+        let cxx = cx0 + col * i as f32;
+        let is_today = i == 2;
+        let wd = n.days_short[weekday(day)];
+        x.text(&wd.chars().take(2).collect::<String>(), (cxx, y0 + 24.0 * s, col, 13.0 * s), 10.0, is_today, if is_today { 0xFFFFFFFF } else { 0xFF6E6E78 }, Align::Center);
+        let r = (cxx + (col - 26.0 * s) / 2.0, y0 + 39.0 * s, 26.0 * s, 26.0 * s);
+        if is_today {
+            x.c.fill_ellipse(r.0, r.1, r.2, r.3, x.a(x.tint));
+        }
+        x.text(&d.to_string(), r, 13.0, is_today, if is_today { 0xFFFFFFFF } else { 0xFFD8D8DE }, Align::Center);
+    }
+    x.text(&format!("{}  ·  {} {}", clock_text(), now.wDay, month), (cx0, y0 + 68.0 * s, cw, 16.0 * s), 11.0, false, DIM, Align::Near);
+    if has_cal {
+        x.hit((cal_x, y0, cal_w - 16.0 * s, CONTENT_H * s), Hit::Tab(Tab::Calendar));
+    }
+    div(x, cal_x + cal_w - 8.0 * s);
+
+    // --- Pintasan Timer (lingkaran seperti tombol "Mirror") ---
+    let d = 72.0 * s;
+    let tcx = bx + bw - pad - tile_w / 2.0 + 4.0 * s;
+    let tcy = y0 + CONTENT_H * s / 2.0;
+    let tr_ = (tcx - d / 2.0, tcy - d / 2.0, d, d);
+    let hit = if has_timer { Hit::Tab(Tab::Timer) } else { Hit::ClockToggle };
+    x.c.fill_ellipse(tr_.0, tr_.1, tr_.2, tr_.3, x.a(if x.hovered(hit) { 0xFF34343B } else { 0xFF26262B }));
+    let (active, running, stopwatch, text) = clock(|c| (c.active(), c.running(), c.stopwatch, c.text(false)));
+    let col = if active { if stopwatch { 0xFFFFFFFF } else { TIMER_COLOR } } else { 0xFFB4B4BE };
+    x.icon(Icon::Stopwatch, (tcx - 12.0 * s, tcy - 22.0 * s, 24.0 * s, 24.0 * s), 22.0, col);
+    let label = if active { text } else { "Timer".to_string() };
+    x.text(&label, (tr_.0, tcy + 6.0 * s, d, 16.0 * s), if active { 12.5 } else { 11.5 }, active && running, col, Align::Center);
+    x.hit(tr_, hit);
     bar
 }
 
@@ -759,7 +899,8 @@ fn compact_items(info: &MediaInfo, sys: &Sys, ch: f32, s: f32, font: &str) -> Co
     };
     let (l, r) = slots();
     let pick = |v: Vec<Slot>| v.into_iter().filter_map(|sl| width(sl).map(|w| (sl, w))).collect();
-    Compact { left: pick(l), right: pick(r) }
+    let (left, right): (Vec<(Slot, f32)>, Vec<(Slot, f32)>) = (pick(l), pick(r));
+    Compact { left, right }
 }
 
 fn side_width(v: &[(Slot, f32)], s: f32) -> f32 {
@@ -852,62 +993,154 @@ fn draw_compact(c: &Canvas, items: &Compact, art: Option<&Image>, info: &MediaIn
     }
 }
 
-/// Ukuran badan kartu notifikasi (lebar, tinggi total termasuk strip bar di atasnya).
-fn notif_dims(s: f32, ch: f32) -> (f32, f32) {
-    (360.0 * s, ch + 54.0 * s)
+/// Ukuran badan kartu (lebar, tinggi total) per jenis kartu; tinggi mengikuti isi, bukan tinggi bar.
+fn notif_dims(s: f32, ch: f32, kind: Option<Kind>) -> (f32, f32) {
+    match kind {
+        Some(Kind::Call) => (450.0 * s, (80.0 * s).max(ch + 24.0 * s)),
+        Some(Kind::Bluetooth { .. }) | Some(Kind::Charging { .. }) => (380.0 * s, (60.0 * s).max(ch + 24.0 * s)),
+        _ => (410.0 * s, (64.0 * s).max(ch + 24.0 * s)),
+    }
 }
 
-/// Pusat tombol tutup (X) pada kartu notifikasi.
-fn notif_close(ear: f32, body_w: f32, ch: f32, s: f32) -> (f32, f32) {
-    (ear + body_w - 18.0 * s, ch + 14.0 * s)
+/// Monogram berwarna (tanpa gambar) di kotak `r`.
+#[allow(clippy::too_many_arguments)]
+fn monogram(c: &Canvas, toast: &Toast, r: Rect, radius: f32, accent: u32, font: &str, s: f32, a: &dyn Fn(u32) -> u32) {
+    c.fill_round_rect(r.0, r.1, r.2, r.3, (radius, radius, radius, radius), a(config::with_alpha(accent, 1.0)));
+    let mono = toast.title.chars().chain(toast.app.chars()).find(|ch| ch.is_alphanumeric()).map(|ch| ch.to_uppercase().to_string()).unwrap_or_else(|| "!".into());
+    c.text(&mono, &Font::new(&face(font, r.3 / s * 0.45), r.3 * 0.45, true), r, a(0xFFFFFFFF), Align::Center);
 }
 
-fn draw_notif(hwnd: HWND, c: &Canvas, body_w: f32, ear: f32, ch: f32, s: f32, fade: f32, font: &str, accent: u32) {
+/// Kartu notifikasi di notch; mengembalikan kotak tombolnya (hit-test).
+#[allow(clippy::too_many_arguments)]
+fn draw_notif(hwnd: HWND, c: &Canvas, body_w: f32, ear: f32, ch: f32, s: f32, fade: f32, font: &str, accent: u32, bg: u32, t_anim: f32) -> Vec<(Rect, Hit)> {
     let cfg = config::current();
-    let Some((toast, hover)) = with(hwnd, |st| st.notif.clone().map(|t| (t, st.hover))).flatten() else { return };
+    let Some((toast, hover, hit)) = with(hwnd, |st| st.notif.clone().map(|t| (t, st.hover, st.hover_hit))).flatten() else { return Vec::new() };
+    let mut x = Ctx { c, s, font: font.to_string(), fade, tint: accent, bg, hover: hit, rects: Vec::new() };
     let a = |col: u32| config::with_alpha(col, fade * ((col >> 24) as f32 / 255.0));
-    let (pad, isz) = (14.0 * s, 38.0 * s);
-    let (_, nh) = notif_dims(s, ch);
-    let iy = ch + (nh - ch - isz) / 2.0;
-    let ty = ch + 4.0 * s; // blok teks: rapat ke strip bar, tanpa celah kosong di atas
-    let ix = ear + pad;
-    let r = 9.0 * s;
+    let (_, nh) = notif_dims(s, ch, Some(toast.kind));
+    let pad = 18.0 * s;
+    // Isi dipusatkan pada seluruh tinggi kartu (tanpa strip kosong setinggi bar di atasnya).
+    let cy = nh / 2.0;
+    let left = ear + pad;
+    let right = ear + body_w - pad;
+    // Gambar banner (avatar/logo) bila ada.
+    let draw_img = |r: Rect, radius: f32| with(hwnd, |st| st.notif_img.as_ref().map(|i| c.draw_image(i, r.0, r.1, r.2, r.3, radius, fade)).is_some()).unwrap_or(false);
 
-    let drawn = with(hwnd, |st| match &st.notif_img {
-        Some(img) => {
-            c.draw_image(img, ix, iy, isz, isz, r, fade);
-            true
+    match toast.kind {
+        Kind::Message => {
+            let isz = 42.0 * s;
+            let ir = (left, cy - isz / 2.0, isz, isz);
+            if !draw_img(ir, 11.0 * s) {
+                monogram(c, &toast, ir, 11.0 * s, accent, font, s, &a);
+            }
+            let tx = left + isz + 13.0 * s;
+            let app = if toast.app.is_empty() { tr("Notifikasi", "Notification").to_string() } else { toast.app.clone() };
+            let meta = format!("{app}  ·  {}", tr("sekarang", "now"));
+            let meta_w = crate::canvas::measure(&meta, &Font::new(font, 11.0 * s, false)) + 2.0 * s;
+            let tw = (right - tx).max(10.0);
+            let title_w = (tw - meta_w - 10.0 * s).max(40.0 * s);
+            x.text(&toast.title, (tx, cy - 20.0 * s, title_w, 20.0 * s), 14.5, true, 0xFFFFFFFF, Align::Near);
+            if hover {
+                let d = 20.0 * s;
+                let r = (right - d, cy - 20.0 * s, d, d);
+                c.fill_ellipse(r.0, r.1, r.2, r.3, a(if hit == Some(Hit::NotifClose) { 0x55FFFFFF } else { 0x33FFFFFF }));
+                x.icon(Icon::Close, r, 9.0, 0xFFFFFFFF);
+                x.hit(r, Hit::NotifClose);
+            } else {
+                x.text(&meta, (right - meta_w, cy - 20.0 * s, meta_w, 20.0 * s), 11.0, false, 0xFF8E8E98, Align::Far);
+            }
+            let body = if cfg.notifications.show_body { toast.body.as_str() } else { "" };
+            if !body.is_empty() {
+                x.text(body, (tx, cy + 1.0 * s, tw, 19.0 * s), 13.0, false, 0xFFB8B8C2, Align::Near);
+            }
         }
-        None => false,
-    })
-    .unwrap_or(false);
-    if !drawn {
-        // Tanpa gambar banner: monogram dari nama aplikasi/judul.
-        c.fill_round_rect(ix, iy, isz, isz, (r, r, r, r), a(config::with_alpha(accent, 0.85)));
-        let mono = toast.app.chars().chain(toast.title.chars()).find(|ch| ch.is_alphanumeric()).map(|ch| ch.to_uppercase().to_string()).unwrap_or_else(|| "!".into());
-        c.text(&mono, &Font::new(font, 18.0 * s, true), (ix, iy, isz, isz), a(0xFFFFFFFF), Align::Center);
+        Kind::Call => {
+            let isz = 54.0 * s;
+            let ir = (left, cy - isz / 2.0, isz, isz);
+            if !draw_img(ir, isz / 2.0) {
+                monogram(c, &toast, ir, isz / 2.0, accent, font, s, &a);
+            }
+            let tx = left + isz + 14.0 * s;
+            let bd = 46.0 * s;
+            let tw = (right - 2.0 * bd - 14.0 * s - tx).max(20.0);
+            let sub = if toast.app.is_empty() { tr("Panggilan masuk", "Incoming call").to_string() } else { format!("{}  ·  {}", toast.app, tr("Panggilan masuk", "Incoming call")) };
+            x.text(&sub, (tx, cy - 22.0 * s, tw, 16.0 * s), 11.5, false, 0xFF9E9EA8, Align::Near);
+            x.text(&toast.title, (tx, cy - 4.0 * s, tw, 28.0 * s), 21.0, true, 0xFFFFFFFF, Align::Near);
+            // Tombol: tolak (merah) dan terima (hijau, berdenyut).
+            let acc = (right - bd, cy - bd / 2.0, bd, bd);
+            let dec = (acc.0 - bd - 14.0 * s, acc.1, bd, bd);
+            let pulse = (t_anim * 0.9).fract();
+            let pr = bd / 2.0 + pulse * 9.0 * s;
+            c.fill_ellipse(acc.0 + bd / 2.0 - pr, acc.1 + bd / 2.0 - pr, 2.0 * pr, 2.0 * pr, a(config::with_alpha(GREEN, 0.35 * (1.0 - pulse))));
+            let hv = |h: Hit, col: u32| if hit == Some(h) { config::with_alpha(col, 1.0) } else { config::with_alpha(col, 0.9) };
+            c.fill_ellipse(dec.0, dec.1, dec.2, dec.3, a(hv(Hit::CallDecline, RED)));
+            c.fill_ellipse(acc.0, acc.1, acc.2, acc.3, a(hv(Hit::CallAccept, GREEN)));
+            x.glyph(G_HANGUP, dec, 19.0, 0xFFFFFFFF);
+            x.glyph(G_PHONE, acc, 18.0, 0xFFFFFFFF);
+            x.hit(dec, Hit::CallDecline);
+            x.hit(acc, Hit::CallAccept);
+        }
+        Kind::Bluetooth { battery, audio } => {
+            let rr = 17.0 * s;
+            let (rcx, rcy) = (left + rr + 2.0 * s, cy);
+            c.stroke_arc(rcx, rcy, rr, 0.0, 360.0, 3.5 * s, a(0x33FFFFFF));
+            let frac = battery.map(|b| b as f32 / 100.0).unwrap_or(1.0);
+            let col = match battery {
+                Some(b) if b <= 20 => RED,
+                _ => CYAN,
+            };
+            c.stroke_arc(rcx, rcy, rr, -90.0, 360.0 * frac, 3.5 * s, a(col));
+            x.icon(Icon::Bluetooth, (rcx - rr, rcy - rr, 2.0 * rr, 2.0 * rr), 15.0, 0xFFFFFFFF);
+            let tx = rcx + rr + 16.0 * s;
+            let tw = (right - 52.0 * s - tx).max(20.0);
+            x.text(&toast.title, (tx, cy - 20.0 * s, tw, 21.0 * s), 15.5, true, 0xFFFFFFFF, Align::Near);
+            let sub = match battery {
+                Some(b) => format!("{}  ·  {b}%", tr("Tersambung", "Connected")),
+                None => tr("Tersambung", "Connected").to_string(),
+            };
+            x.text(&sub, (tx, cy + 1.0 * s, tw, 18.0 * s), 12.5, false, 0xFF9E9EA8, Align::Near);
+            // Lingkaran ikon perangkat dengan cincin bercahaya.
+            let d = 42.0 * s;
+            let (ocx, ocy) = (right - d / 2.0, cy);
+            c.fill_ellipse(ocx - d / 2.0 - 4.0 * s, ocy - d / 2.0 - 4.0 * s, d + 8.0 * s, d + 8.0 * s, a(0x225AC8FA));
+            c.fill_ellipse(ocx - d / 2.0, ocy - d / 2.0, d, d, a(0xFF12222C));
+            c.stroke_arc(ocx, ocy, d / 2.0 - 1.0 * s, 0.0, 360.0, 2.0 * s, a(0xCC5AC8FA));
+            let ir = (ocx - d / 2.0, ocy - d / 2.0, d, d);
+            if audio {
+                x.glyph(G_HEADPHONE, ir, 18.0, 0xFFE6F6FF);
+            } else {
+                x.icon(Icon::Bluetooth, ir, 18.0, 0xFFE6F6FF);
+            }
+        }
+        Kind::Charging { pct } => {
+            let rr = 17.0 * s;
+            let (rcx, rcy) = (left + rr + 2.0 * s, cy);
+            c.stroke_arc(rcx, rcy, rr, 0.0, 360.0, 3.5 * s, a(0x33FFFFFF));
+            c.stroke_arc(rcx, rcy, rr, -90.0, 360.0 * (pct as f32 / 100.0), 3.5 * s, a(GREEN));
+            // Petir.
+            let u = rr / 12.0;
+            let bolt = [(1.5, -8.0), (-5.0, 1.0), (-0.5, 1.0), (-1.5, 8.0), (5.0, -1.0), (0.5, -1.0)];
+            let pts: Vec<(f32, f32)> = bolt.iter().map(|&(px, py)| (rcx + px * u, rcy + py * u)).collect();
+            c.fill_polygon(&pts, a(0xFFFFFFFF));
+            let tx = rcx + rr + 16.0 * s;
+            let pw = 80.0 * s;
+            let tw = (right - pw - tx).max(20.0);
+            x.text(&toast.title, (tx, cy - 20.0 * s, tw, 21.0 * s), 15.5, true, 0xFFFFFFFF, Align::Near);
+            x.text(&toast.body, (tx, cy + 1.0 * s, tw, 18.0 * s), 12.5, false, 0xFF9E9EA8, Align::Near);
+            x.text(&format!("{pct}%"), (right - pw, cy - 18.0 * s, pw, 36.0 * s), 27.0, false, 0xFFFFFFFF, Align::Far);
+        }
     }
-
-    let tx = ix + isz + 12.0 * s;
-    let tw = (ear + body_w - pad - tx - 22.0 * s).max(10.0);
-    let app = if toast.app.is_empty() { "Notifikasi" } else { toast.app.as_str() };
-    c.text(app, &Font::new(font, 10.5 * s, false), (tx, ty, tw, 14.0 * s), a(0xFF8E8E98), Align::Near);
-    c.text(&toast.title, &Font::new(font, 13.5 * s, true), (tx, ty + 13.0 * s, tw, 19.0 * s), a(0xFFFFFFFF), Align::Near);
-    if cfg.notifications.show_body && !toast.body.is_empty() {
-        c.text(&toast.body, &Font::new(font, 12.0 * s, false), (tx, ty + 31.0 * s, tw, 17.0 * s), a(0xFFB4B4BE), Align::Near);
-    }
-
-    if hover {
-        let (cx, cy) = notif_close(ear, body_w, ch, s);
-        let d = 18.0 * s;
-        c.fill_ellipse(cx - d / 2.0, cy - d / 2.0, d, d, a(0x40FFFFFF));
-        c.text("\u{00D7}", &Font::new(font, 14.0 * s, true), (cx - d / 2.0, cy - d / 2.0 - 1.0 * s, d, d), a(0xFFFFFFFF), Align::Center);
-    }
+    x.rects
 }
 
 /// Tampilkan banner notifikasi di notch ini (antre bila sedang menampilkan yang lain; maks 8).
 pub fn notify(hwnd: HWND, t: Toast) {
-    if !config::current().notifications.enabled {
+    let cfg = config::current();
+    if !cfg.notifications.enabled {
+        return;
+    }
+    // Privasi: bawaan hanya monitor utama yang menampilkan kartu.
+    if cfg.notifications.monitors != "all" && !with(hwnd, |st| st.mon.primary).unwrap_or(false) {
         return;
     }
     let _ = with(hwnd, |st| {
@@ -927,17 +1160,21 @@ fn advance_notif(hwnd: HWND) -> bool {
         }
         let Some(t) = st.queue.pop_front() else { return false };
         // Ikon asli: gambar banner bila tertangkap; kalau tidak, ikon aplikasi yang cocok dengan nama pengirim.
-        st.notif_img = t.icon.as_ref().and_then(|b| Image::from_bytes(b)).or_else(|| crate::popup::app_icon(&t.app));
+        st.notif_img = match t.kind {
+            Kind::Message | Kind::Call => t.icon.as_ref().and_then(|b| Image::from_bytes(b)).or_else(|| crate::popup::app_icon(&t.app)),
+            _ => None,
+        };
         st.notif = Some(t);
         st.n_target = true;
         st.hover = false;
+        st.hover_hit = None;
         st.last = Instant::now();
         true
     })
     .unwrap_or(false);
     if started {
         start_anim(hwnd, false); // panel menutup dulu
-        let dur = config::current().notifications.duration_ms.max(1000);
+        let dur = notif_duration(hwnd);
         unsafe {
             SetTimer(Some(hwnd), TIMER_ANIM, FRAME_MS, None);
             SetTimer(Some(hwnd), TIMER_NOTIF, dur, None);
@@ -961,6 +1198,36 @@ fn notif_active(hwnd: HWND) -> bool {
     with(hwnd, |st| st.notif.is_some() && st.n_target).unwrap_or(false)
 }
 
+/// Lama kartu yang sedang tampil: panggilan bertahan hingga 30 dtk, aktivitas sistem sebentar.
+fn notif_duration(hwnd: HWND) -> u32 {
+    let base = config::current().notifications.duration_ms.max(1000);
+    match with(hwnd, |st| st.notif.as_ref().map(|t| t.kind)).flatten() {
+        Some(Kind::Call) => 30_000,
+        Some(Kind::Bluetooth { .. }) | Some(Kind::Charging { .. }) => base.min(3500),
+        _ => base,
+    }
+}
+
+thread_local! {
+    static CHARGING: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Status daya berubah: bila pengisi daya baru saja dicolokkan, tampilkan kartu di semua notch.
+/// (Setiap notch menerima siaran yang sama; status bersama mencegah kartu ganda.)
+fn on_power() {
+    let Some((pct, charging)) = crate::bar::battery() else { return };
+    let was = CHARGING.with(|c| c.replace(Some(charging)));
+    if was != Some(false) || !charging {
+        return;
+    }
+    let mut t = Toast::message("", tr("Mengisi daya", "Charging"), tr("Pengisi daya tersambung", "Charger connected"));
+    t.kind = Kind::Charging { pct };
+    let all: Vec<isize> = WINS.with(|w| w.borrow().keys().copied().collect());
+    for h in all {
+        notify(HWND(h as *mut _), t.clone());
+    }
+}
+
 pub fn redraw(hwnd: HWND) {
     let cfg = config::current();
     let info = media::info();
@@ -981,7 +1248,8 @@ pub fn redraw(hwnd: HWND) {
     }
 
     // Statistik sistem: sampel paling sering sekali per detik, hanya saat tab Sistem terlihat.
-    let compact_sys = has_slot(Slot::Cpu) || has_slot(Slot::Battery);
+    // Notch ringkas selalu butuh baterai (isi bawaan saat idle = baterai + jam).
+    let compact_sys = true;
     let sys_due = with(hwnd, |st| {
         let visible = (st.tab == Tab::System && st.x > 0.5) || (compact_sys && st.x < 0.5);
         visible && st.sys_at.map(|t| t.elapsed() >= Duration::from_millis(900)).unwrap_or(true)
@@ -994,15 +1262,16 @@ pub fn redraw(hwnd: HWND) {
         });
     }
 
-    let Some((x, nt, mon, tab, week_off, hover, sys, born)) = with(hwnd, |st| (st.x, st.nt, st.mon, st.tab, st.week_off, st.hover_hit, st.sys, st.born)) else { return };
+    let Some((x, nt, mon, tab, week_off, hover, sys, born, kind)) = with(hwnd, |st| (st.x, st.nt, st.mon, st.tab, st.week_off, st.hover_hit, st.sys, st.born, st.notif.as_ref().map(|t| t.kind))) else { return };
     let s = mon.scale;
     let pill = pill();
     let (cw, ew, ch, eh) = dims(s);
     let items = compact_items(&info, &sys, ch, s, &cfg.bar.font);
+    let idle = items.left.is_empty() && items.right.is_empty();
     let cw = compact_body(cw, &items, s);
     let ear = if pill { 0.0 } else { 8.0 * s };
     let xc = x.clamp(0.0, 1.15);
-    let (nw, nh) = notif_dims(s, ch);
+    let (nw, nh) = notif_dims(s, ch, kind);
     let nc = nt.clamp(0.0, 1.1);
     let body_w = lerp(lerp(cw, ew, xc), nw, nc).round();
     let h = lerp(lerp(ch, eh, xc), nh, nc).round();
@@ -1013,44 +1282,83 @@ pub fn redraw(hwnd: HWND) {
     let accent = config::color(&cfg.notch.accent);
     let tint_col = if cfg.notch.tint_from_artwork { tint.unwrap_or(accent) } else { accent };
     let mut rects = Vec::new();
+    let mut notif_rects = Vec::new();
     let mut seek_bar = (0.0, 0.0, 0.0, 0.0);
     let t_anim = born.elapsed().as_secs_f32();
 
-    if let Some(c) = Canvas::new(w as i32, h as i32) {
+    // Ikon aplikasi sumber media: dicari sekali per AppUserModelID.
+    let source = with(hwnd, |st| {
+        if st.source.as_ref().map(|(k, _)| k != &info.source).unwrap_or(true) {
+            st.source = Some((info.source.clone(), crate::dock::source_app(&info.source)));
+        }
+        st.source.take()
+    })
+    .flatten();
+
+    // Kanvas dipakai ulang; diperbesar (dengan sisa ruang untuk pantulan spring) hanya bila perlu.
+    let mut canvas = with(hwnd, |st| st.canvas.take()).flatten();
+    if canvas.as_ref().map(|c| c.w < w as i32 || c.h < h as i32).unwrap_or(true) {
+        let need_w = (w.max(ew + 2.0 * ear) * 1.12).ceil() as i32;
+        let need_h = (h.max(eh).max(ch + 90.0 * s) * 1.12).ceil() as i32;
+        canvas = Canvas::new(need_w, need_h);
+    }
+    if let Some(c) = canvas.as_ref() {
+        c.clear();
+        let br = lerp(lerp(10.0 * s, 26.0 * s, t), 26.0 * s, nt.clamp(0.0, 1.0));
         if pill {
-            let r = lerp(ch / 2.0, 24.0 * s, t).min(h / 2.0);
+            let r = lerp(lerp(ch / 2.0, 24.0 * s, t), 26.0 * s, nt.clamp(0.0, 1.0)).min(h / 2.0);
             c.fill_round_rect(0.0, 0.0, w, h, (r, r, r, r), bg);
         } else {
-            c.fill_notch(w, h, ear, lerp(lerp(10.0 * s, 26.0 * s, t), 22.0 * s, nt.clamp(0.0, 1.0)), bg);
+            c.fill_notch(w, h, ear, br, bg);
         }
 
         if nt > 0.5 {
-            draw_notif(hwnd, &c, body_w, ear, ch, s, ((nt - 0.5) / 0.4).clamp(0.0, 1.0), &cfg.bar.font, accent);
+            notif_rects = draw_notif(hwnd, c, body_w, ear, ch, s, ((nt - 0.5) / 0.4).clamp(0.0, 1.0), &cfg.bar.font, accent, bg, t_anim);
         }
 
         if t < 0.45 && nt < 0.25 {
-            let f = (1.0 - t / 0.45).clamp(0.0, 1.0);
-            draw_compact(&c, &items, art.as_ref().map(|(_, i)| i), &info, &sys, ear, body_w, ch, s, f, tint_col, bg, &cfg.bar.font, t_anim);
+            let f = (1.0 - t / 0.45).clamp(0.0, 1.0) * (1.0 - nt / 0.25).clamp(0.0, 1.0);
+            if idle {
+                if crate::idle::enabled() {
+                    let (growth, bloom) = clock(|k| {
+                        let used = k.active() && (k.running() || k.alarm());
+                        let g = if !used { None } else if k.stopwatch { Some((k.elapsed().as_secs_f32() % 1500.0) / 1500.0) } else { Some(k.elapsed().as_secs_f32() / k.target.as_secs_f32().max(1.0)) };
+                        (g, k.alarm())
+                    });
+                    let inp = crate::idle::Input { ear, body_w, h: ch, s, f, bg, tint: tint_col, t: t_anim, cpu: sys.cpu, battery: sys.battery, growth, bloom, br };
+                    crate::idle::draw(c, &inp);
+                }
+            } else {
+                draw_compact(c, &items, art.as_ref().map(|(_, i)| i), &info, &sys, ear, body_w, ch, s, f, tint_col, bg, &cfg.bar.font, t_anim);
+            }
         }
 
         if t > 0.55 && nt < 0.25 {
             let fade = ((t - 0.55) / 0.35).clamp(0.0, 1.0);
-            let mut cx = Ctx { c: &c, s, font: cfg.bar.font.clone(), fade, tint: tint_col, bg, hover, rects: Vec::new() };
+            let mut cx = Ctx { c, s, font: cfg.bar.font.clone(), fade, tint: tint_col, bg, hover, rects: Vec::new() };
 
-            // Strip atas: ikon tab di kiri, Pengaturan di kanan.
+            // Strip atas: tab berlabel (pil) di kiri, Pengaturan di kanan.
             let tabs = tabs();
-            let strip_c = ch / 2.0 + if pill { 2.0 * s } else { 0.0 };
+            let strip_c = ch / 2.0 + if pill { 3.0 * s } else { 1.0 * s };
             if tabs.len() > 1 {
-                for (i, tb) in tabs.iter().enumerate() {
-                    let d = (ch - 6.0 * s).min(26.0 * s);
-                    let r = (ear + 14.0 * s + i as f32 * (d + 4.0 * s), strip_c - d / 2.0, d, d);
-                    if *tb == tab {
-                        c.fill_ellipse(r.0, r.1, r.2, r.3, cx.a(0x30FFFFFF));
+                let f = Font::new(&cfg.bar.font, 12.0 * s, true);
+                let mut tx = ear + 14.0 * s;
+                let ph = (ch - 6.0 * s).min(24.0 * s);
+                for tb in tabs.iter() {
+                    let lw = crate::canvas::measure(tb.label(), &f);
+                    let pw = 10.0 * s + 14.0 * s + 5.0 * s + lw + 11.0 * s;
+                    let r = (tx, strip_c - ph / 2.0, pw, ph);
+                    let on = *tb == tab;
+                    if on {
+                        cx.round(r, ph / 2.0 / s, 0x33FFFFFF);
                     } else if cx.hovered(Hit::Tab(*tb)) {
-                        c.fill_ellipse(r.0, r.1, r.2, r.3, cx.a(0x18FFFFFF));
+                        cx.round(r, ph / 2.0 / s, 0x1AFFFFFF);
                     }
-                    cx.icon(tb.icon(), r, 13.0, if *tb == tab { 0xFFFFFFFF } else { DIM });
+                    let col = if on { 0xFFFFFFFF } else { DIM };
+                    cx.icon(tb.icon(), (tx + 10.0 * s, r.1, 14.0 * s, ph), 13.0, col);
+                    cx.text(tb.label(), (tx + 29.0 * s, r.1, lw + 4.0 * s, ph), 12.0, true, col, Align::Near);
                     cx.hit(r, Hit::Tab(*tb));
+                    tx += pw + 4.0 * s;
                 }
             }
             let d = (ch - 6.0 * s).min(26.0 * s);
@@ -1059,7 +1367,10 @@ pub fn redraw(hwnd: HWND) {
             let y0 = ch + ((h - ch) - CONTENT_H * s) / 2.0 - 2.0 * s;
             let y0 = y0.max(ch + 4.0 * s);
             match tab {
-                Tab::Media => seek_bar = draw_media(&mut cx, art.as_ref().map(|(_, i)| i), &info, ear, body_w, y0),
+                Tab::Media => {
+                    let src = source.as_ref().and_then(|(_, v)| v.as_ref());
+                    seek_bar = draw_media(&mut cx, art.as_ref().map(|(_, i)| i), src, &info, ear, body_w, y0, tabs.contains(&Tab::Calendar), tabs.contains(&Tab::Timer))
+                }
                 Tab::Calendar => draw_calendar(&mut cx, ear, body_w, y0, week_off),
                 Tab::Timer => draw_timer(&mut cx, ear, body_w, y0),
                 Tab::System => draw_system(&mut cx, &sys, ear, body_w, y0),
@@ -1068,13 +1379,17 @@ pub fn redraw(hwnd: HWND) {
         }
 
         let y = mon.y + if pill { (4.0 * s).round() as i32 } else { 0 };
-        c.present(hwnd, Some((mon.x + ((mon.w as f32 - w) / 2.0).round() as i32, y)));
+        c.present_size(hwnd, Some((mon.x + ((mon.w as f32 - w) / 2.0).round() as i32, y)), w as i32, h as i32);
     }
     with(hwnd, |st| {
         st.art = art;
         st.tint = tint;
         st.rects = rects;
+        st.notif_rects = notif_rects;
         st.seek_bar = seek_bar;
+        st.canvas = canvas;
+        st.idle = idle;
+        st.source = source;
     });
     sync_tick(hwnd);
 }
@@ -1165,10 +1480,6 @@ fn track_leave(hwnd: HWND) {
     }
 }
 
-fn near(p: (f32, f32), x: f32, y: f32, r: f32) -> bool {
-    (x - p.0).abs() <= r && (y - p.1).abs() <= r
-}
-
 fn hit_at(hwnd: HWND, x: f32, y: f32) -> Option<Hit> {
     with(hwnd, |st| st.rects.iter().rev().find(|(r, _)| x >= r.0 && x < r.0 + r.2 && y >= r.1 && y < r.1 + r.3).map(|(_, h)| *h)).flatten()
 }
@@ -1194,11 +1505,25 @@ fn switch_tab(hwnd: HWND, dir: i32) {
 fn click(hwnd: HWND, mx: f32, my: f32) {
     let Some((open, s)) = with(hwnd, |st| (st.target_open, st.mon.scale)) else { return };
     if notif_active(hwnd) {
-        let (nw, _) = notif_dims(s, dims(s).2);
-        let ear = if pill() { 0.0 } else { 8.0 * s };
-        let (cx, cy) = notif_close(ear, nw, dims(s).2, s);
-        if !near((cx, cy), mx, my, 12.0 * s) {
-            crate::notifications::activate(); // teruskan klik ke banner aslinya
+        let toast = with(hwnd, |st| st.notif.clone()).flatten();
+        let hit = with(hwnd, |st| st.notif_rects.iter().rev().find(|(r, _)| mx >= r.0 && mx < r.0 + r.2 && my >= r.1 && my < r.1 + r.3).map(|(_, h)| *h)).flatten();
+        use crate::notifications::{activate, invoke_action, ACCEPT_WORDS, DECLINE_WORDS};
+        match (hit, toast) {
+            (Some(Hit::NotifClose), _) => {}
+            (Some(Hit::CallAccept), Some(t)) => match t.action_like(ACCEPT_WORDS) {
+                Some(a) => invoke_action(a),
+                None => activate(),
+            },
+            (Some(Hit::CallDecline), Some(t)) => {
+                if let Some(a) = t.action_like(DECLINE_WORDS) {
+                    invoke_action(a);
+                }
+            }
+            // Aktivitas sistem: klik hanya menutup kartu.
+            (_, Some(t)) if matches!(t.kind, Kind::Bluetooth { .. } | Kind::Charging { .. }) => {}
+            // Klik di bagian lain kartu panggilan tidak menutupnya (agar tidak salah tekan).
+            (_, Some(t)) if t.kind == Kind::Call => return,
+            _ => activate(), // teruskan klik ke banner aslinya
         }
         dismiss_notif(hwnd);
         return;
@@ -1260,6 +1585,7 @@ fn click(hwnd: HWND, mx: f32, my: f32) {
                     c.since = Some(Instant::now());
                 }
             }),
+            Hit::CallAccept | Hit::CallDecline | Hit::NotifClose => {}
         }
         redraw_all();
         return;
@@ -1277,10 +1603,18 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             if notif_active(hwnd) {
                 // Kursor di atas kartu: tahan kedaluwarsa dan tampilkan tombol X.
                 let first = with(hwnd, |st| !std::mem::replace(&mut st.hover, true)).unwrap_or(false);
+                let (mx, my) = ((lparam.0 & 0xFFFF) as i16 as f32, ((lparam.0 >> 16) & 0xFFFF) as i16 as f32);
+                let changed = with(hwnd, |st| {
+                    let h = st.notif_rects.iter().rev().find(|(r, _)| mx >= r.0 && mx < r.0 + r.2 && my >= r.1 && my < r.1 + r.3).map(|(_, h)| *h);
+                    std::mem::replace(&mut st.hover_hit, h) != h
+                })
+                .unwrap_or(false);
                 if first {
                     unsafe {
                         let _ = KillTimer(Some(hwnd), TIMER_NOTIF);
                     }
+                }
+                if first || changed {
                     redraw(hwnd);
                 }
                 return LRESULT(0);
@@ -1306,7 +1640,7 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             });
             if notif_active(hwnd) {
                 with(hwnd, |st| st.hover = false);
-                let dur = config::current().notifications.duration_ms.max(1000);
+                let dur = notif_duration(hwnd);
                 unsafe {
                     SetTimer(Some(hwnd), TIMER_NOTIF, dur, None);
                 }
@@ -1337,6 +1671,13 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             click(hwnd, x, y);
             LRESULT(0)
         }
+        0x0218 => {
+            // WM_POWERBROADCAST / PBT_APMPOWERSTATUSCHANGE: kartu "Mengisi daya" saat pengisi daya dicolokkan.
+            if wparam.0 == 0x000A {
+                on_power();
+            }
+            LRESULT(1)
+        }
         WM_RBUTTONUP => {
             crate::show_menu(hwnd);
             LRESULT(0)
@@ -1353,9 +1694,17 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 TIMER_NOTIF => dismiss_notif(hwnd),
                 TIMER_Z => {
                     // Jangan merebut posisi atas dari menu/popup yang sedang terbuka (mereka sengaja di atas notch).
-                    if !crate::FULLSCREEN.load(std::sync::atomic::Ordering::Relaxed) && !crate::menu::is_open() && !crate::popup::any_open() {
+                    if !crate::FULLSCREEN.load(std::sync::atomic::Ordering::Relaxed) {
                         unsafe {
-                            let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                            if crate::menu::is_open() || crate::popup::any_open() {
+                                // Menu/popup sengaja di atas notch: jangan rebut posisinya, cukup pastikan menu bar
+                                // berada DI BAWAH notch (bar sering naik saat diklik dan menutupi notch).
+                                for b in crate::bars() {
+                                    let _ = SetWindowPos(b, Some(hwnd), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                                }
+                            } else {
+                                let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                            }
                         }
                     }
                 }

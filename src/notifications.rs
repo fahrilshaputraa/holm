@@ -23,6 +23,15 @@ use windows_core::implement;
 
 pub const WM_NOTIFY_TOAST: u32 = WM_APP + 30;
 
+/// Jenis kartu di notch: notifikasi biasa, panggilan masuk, atau aktivitas sistem (perangkat Bluetooth, pengisi daya).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Kind {
+    Message,
+    Call,
+    Bluetooth { battery: Option<u8>, audio: bool },
+    Charging { pct: u8 },
+}
+
 #[derive(Clone)]
 pub struct Toast {
     pub app: String,
@@ -30,15 +39,51 @@ pub struct Toast {
     pub body: String,
     /// Gambar banner (BMP) bila ada: avatar/logo.
     pub icon: Option<Vec<u8>>,
+    /// Nama tombol aksi di banner aslinya (mis. "Accept", "Decline"); diklik lewat `invoke_action`.
+    pub actions: Vec<String>,
+    pub kind: Kind,
+}
+
+impl Toast {
+    pub fn message(app: &str, title: &str, body: &str) -> Toast {
+        Toast { app: app.into(), title: title.into(), body: body.into(), icon: None, actions: Vec::new(), kind: Kind::Message }
+    }
+
+    /// Tombol aksi yang cocok dengan salah satu kata kunci (huruf kecil).
+    pub fn action_like(&self, words: &[&str]) -> Option<&str> {
+        self.actions.iter().find(|a| {
+            let l = a.to_lowercase();
+            words.iter().any(|w| l.contains(w))
+        }).map(|s| s.as_str())
+    }
+}
+
+pub const ACCEPT_WORDS: &[&str] = &["accept", "answer", "terima", "jawab", "angkat", "pick up"];
+pub const DECLINE_WORDS: &[&str] = &["decline", "reject", "tolak", "ignore", "abaikan", "hang up", "end call", "akhiri"];
+
+/// Banner panggilan masuk (WhatsApp, Phone Link, Teams, Zoom, Telegram, ...)?
+fn is_call(app: &str, title: &str, body: &str, actions: &[String]) -> bool {
+    let has = |words: &[&str]| actions.iter().any(|a| {
+        let l = a.to_lowercase();
+        words.iter().any(|w| l.contains(w))
+    });
+    if has(ACCEPT_WORDS) && has(DECLINE_WORDS) {
+        return true;
+    }
+    let text = format!("{app} {title} {body}").to_lowercase();
+    ["incoming call", "incoming voice call", "incoming video call", "is calling", "calling you", "panggilan masuk", "panggilan suara masuk", "panggilan video masuk", "sedang menelepon", "memanggil anda"]
+        .iter()
+        .any(|k| text.contains(k))
 }
 
 #[derive(Default)]
 struct Signal {
     scan: bool,
     invoke: bool,
+    action: Option<String>,
 }
 
-static SIGNAL: Mutex<Signal> = Mutex::new(Signal { scan: false, invoke: false });
+static SIGNAL: Mutex<Signal> = Mutex::new(Signal { scan: false, invoke: false, action: None });
 static CV: Condvar = Condvar::new();
 
 /// Minta pemindaian cepat (ada jendela baru yang mungkin sebuah banner).
@@ -53,6 +98,14 @@ pub fn kick() {
 pub fn activate() {
     if let Ok(mut g) = SIGNAL.lock() {
         g.invoke = true;
+        CV.notify_one();
+    }
+}
+
+/// Klik tombol aksi bernama `name` di banner asli (mis. Terima/Tolak panggilan).
+pub fn invoke_action(name: &str) {
+    if let Ok(mut g) = SIGNAL.lock() {
+        g.action = Some(name.to_string());
         CV.notify_one();
     }
 }
@@ -170,9 +223,10 @@ unsafe fn worker(main_tid: u32, poll_ms: u32) {
         let mut sc = Scanner { uia, seen: Vec::new(), last: None, procs: HashMap::new(), main_tid };
         loop {
             let (mut burst, mut single, mut invoke) = (false, false, false);
+            let action: Option<String>;
             {
                 let Ok(mut g) = SIGNAL.lock() else { return };
-                if !g.scan && !g.invoke {
+                if !g.scan && !g.invoke && g.action.is_none() {
                     let dur = if poll_ms > 0 { Duration::from_millis(poll_ms as u64) } else { Duration::from_secs(3600) };
                     match CV.wait_timeout(g, dur) {
                         Ok((g2, to)) => {
@@ -184,6 +238,10 @@ unsafe fn worker(main_tid: u32, poll_ms: u32) {
                 }
                 burst |= std::mem::take(&mut g.scan);
                 invoke |= std::mem::take(&mut g.invoke);
+                action = g.action.take();
+            }
+            if let Some(a) = action {
+                sc.invoke_action(&a);
             }
             if invoke {
                 sc.invoke();
@@ -277,13 +335,21 @@ impl Scanner {
     unsafe fn read_toast(&mut self, toast: &IUIAutomationElement, cond: &IUIAutomationCondition) {
         unsafe {
             let mut texts: Vec<String> = Vec::new();
+            let mut actions: Vec<String> = Vec::new();
             let mut image: Option<IUIAutomationElement> = None;
             let mut best = 0i32;
             if let Ok(kids) = toast.FindAll(TreeScope_Descendants, cond) {
                 for i in 0..kids.Length().unwrap_or(0).min(200) {
                     let Ok(k) = kids.GetElement(i) else { continue };
                     let ct = k.CurrentControlType().unwrap_or_default();
-                    if ct == UIA_TextControlTypeId {
+                    if ct == UIA_ButtonControlTypeId {
+                        let n = bstr(k.CurrentName()).trim().to_string();
+                        let l = n.to_lowercase();
+                        let generic = ["close", "tutup", "dismiss", "setting", "pengaturan", "option", "opsi", "more", "lainnya"].iter().any(|w| l.contains(w));
+                        if !n.is_empty() && !generic && !actions.contains(&n) {
+                            actions.push(n);
+                        }
+                    } else if ct == UIA_TextControlTypeId {
                         let t = bstr(k.CurrentName()).trim().to_string();
                         if !t.is_empty() && !texts.contains(&t) {
                             texts.push(t);
@@ -326,8 +392,28 @@ impl Scanner {
                 })
             });
             dbg(&format!("banner: app='{app}' judul='{title}' logo_asli={}", logo_for(&app).is_some()));
-            let t = Box::new(Toast { app, title, body, icon });
+            let kind = if is_call(&app, &title, &body, &actions) { Kind::Call } else { Kind::Message };
+            let t = Box::new(Toast { app, title, body, icon, actions, kind });
             let _ = PostThreadMessageW(self.main_tid, WM_NOTIFY_TOAST, WPARAM(0), LPARAM(Box::into_raw(t) as isize));
+        }
+    }
+
+    /// Tekan tombol bernama `name` di dalam banner terakhir.
+    fn invoke_action(&mut self, name: &str) {
+        unsafe {
+            let Some(el) = &self.last else { return };
+            let Ok(cond) = self.uia.CreateTrueCondition() else { return };
+            let Ok(all) = el.FindAll(TreeScope_Descendants, &cond) else { return };
+            for i in 0..all.Length().unwrap_or(0).min(200) {
+                let Ok(k) = all.GetElement(i) else { continue };
+                if k.CurrentControlType().unwrap_or_default() != UIA_ButtonControlTypeId || bstr(k.CurrentName()).trim() != name {
+                    continue;
+                }
+                if let Ok(ip) = k.GetCurrentPattern(UIA_InvokePatternId).and_then(|p| p.cast::<IUIAutomationInvokePattern>()) {
+                    let _ = ip.Invoke();
+                }
+                return;
+            }
         }
     }
 

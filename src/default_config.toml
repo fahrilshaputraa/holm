@@ -4,7 +4,7 @@
 # Warna: "#RRGGBB" atau "#AARRGGBB".
 
 [general]
-config_version = 6         # dipakai untuk migrasi otomatis; jangan diubah
+config_version = 7         # dipakai untuk migrasi otomatis; jangan diubah
 language = "id"            # "id" | "en"  (nama hari & bulan pada jam)
 accent = "#0A84FF"          # warna sorotan popup (kalender, slider, pilihan)
 
@@ -34,10 +34,14 @@ style = "notch"              # "notch" (menyatu dengan bar) | "pill" (pulau mela
 background = "#000000"
 accent = "#1DB954"
 tint_from_artwork = true     # warna visualizer & progres mengikuti sampul lagu
+# Animasi notch saat tidak ada aktivitas: "off" (polos) | "cat" (Holm si kucing) | "rain" (hujan di kaca, ikut cuaca)
+# | "aquarium" (air = baterai) | "fireflies" (kunang-kunang) | "sky" (matahari/bulan ikut jam) | "plant" (tanaman tumbuh saat Timer)
+# | "pulse" (detak mengikuti CPU) | "stars" (bintang jatuh) | "wave" (gelombang mengikuti suara)
+idle_animation = "cat"
 compact_width = 210
 compact_height = 28
-expanded_width = 480
-expanded_height = 132
+expanded_width = 640
+expanded_height = 150
 # Tab saat notch terbuka (urutan = urutan ikon). Pilihan: media, calendar, timer, system
 tabs = ["media", "calendar", "timer", "system"]
 default_tab = "media"
@@ -58,6 +62,11 @@ icon_size = 13          # ukuran ikon di bar (px)
 pinned = []             # selalu langsung di bar, mis. ["discord.exe", "onedrive"] (nama exe atau teks tooltip)
 hidden = []             # tidak pernah ditampilkan
 
+[weather]
+# Cuaca untuk animasi notch "Hujan di kaca" dan payung si kucing. Hanya nama kota yang dikirim ke Open-Meteo
+# (gratis, tanpa akun). Kosong = tidak ada data dikirim; animasi hujan tampil sebagai hiasan.
+city = ""
+
 [control]
 # Isi popup Control Center (ikon di bar). Pilihan: wifi, bluetooth, airplane, dnd, cast, display, sound, media
 modules = ["wifi", "bluetooth", "airplane", "dnd", "cast", "display", "sound", "media"]
@@ -70,7 +79,7 @@ enabled = true
 # Dock ala macOS yang menggantikan taskbar Windows (taskbar asli disembunyikan, bukan diubah setting-nya,
 # dan dipulihkan saat aplikasi keluar). Fungsi tray/jam/Start ada di menu bar atas.
 enabled = true
-monitors = "primary"           # "all" | "primary"
+monitors = "all"               # "all" | "primary"
 icon_size = 48
 magnification = 1.7          # 1.0 = tanpa pembesaran
 background = "#1C1C20"
@@ -91,6 +100,7 @@ import_taskbar_pins = true     # ikut menyematkan aplikasi yang di-pin di taskba
 enabled = true
 duration_ms = 5000
 show_body = true        # false = hanya tampilkan aplikasi + judul
+monitors = "primary"    # kartu notifikasi/panggilan/Bluetooth/pengisi daya: "primary" (hanya monitor utama, privasi) | "all"
 poll_ms = 2000          # pemindaian cadangan bila event terlewat (0 = hanya event; lebih hemat baterai)
 
 [launcher]

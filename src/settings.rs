@@ -155,6 +155,8 @@ const SECTIONS: &[Section] = &[
                 fields: &[
                     f("notch", "enabled", "Tampilkan notch", "Live activity, tab, dan banner notifikasi", Kind::Toggle),
                     f("notch", "style", "Bentuk", "", Kind::Choice(&[("notch", "Notch"), ("pill", "Pill")])),
+                    f("notch", "idle_animation", "Animasi saat idle", "Tampil saat tidak ada musik, timer, atau notifikasi", Kind::Choice(&[("off", "Mati"), ("cat", "Holm si kucing"), ("rain", "Hujan di kaca"), ("aquarium", "Akuarium"), ("fireflies", "Kunang-kunang"), ("sky", "Langit"), ("plant", "Tanaman"), ("pulse", "Detak"), ("stars", "Bintang jatuh"), ("wave", "Gelombang suara")])),
+                    f("weather", "city", "Kota untuk cuaca", "Untuk hujan di kaca dan payung si kucing. Hanya nama kota yang dikirim ke Open-Meteo; kosong = tanpa data cuaca", Kind::Text),
                     f("notch", "monitors", "Monitor", "", MONITORS),
                     f("notch", "expand_on_hover", "Buka saat kursor di atasnya", "Gulir di atas notch untuk pindah tab", Kind::Toggle),
                 ],
@@ -280,6 +282,7 @@ const SECTIONS: &[Section] = &[
             title: "",
             fields: &[
                 f("notifications", "enabled", "Banner notifikasi di notch", "Membaca banner Windows yang sedang tampil", Kind::Toggle),
+                f("notifications", "monitors", "Monitor kartu", "Kartu notifikasi, panggilan, Bluetooth, dan pengisi daya. Bawaan: hanya monitor utama (privasi)", MONITORS),
                 f("notifications", "show_body", "Tampilkan isi pesan", "Mati = hanya aplikasi dan judul", Kind::Toggle),
                 f("notifications", "duration_ms", "Lama tampil", "", int(2000.0, 15000.0, 500.0, "s")),
             ],
