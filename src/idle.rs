@@ -50,9 +50,10 @@ fn kind() -> String {
     config::current().notch.idle_animation.trim().to_lowercase()
 }
 
-/// Hemat daya: baterai lemah tanpa pengisi daya atau aplikasi layar penuh = tanpa gerakan.
+/// Hemat daya: baterai hampir habis (< 5%) tanpa pengisi daya atau aplikasi layar penuh = tanpa gerakan.
+/// (Dulu < 20%: animasi tampak rusak/diam di laptop yang baterainya memang sering rendah.)
 fn low_power(battery: Option<(u8, bool)>) -> bool {
-    crate::FULLSCREEN.load(std::sync::atomic::Ordering::Relaxed) || matches!(battery, Some((p, false)) if p < 20)
+    crate::FULLSCREEN.load(std::sync::atomic::Ordering::Relaxed) || matches!(battery, Some((p, false)) if p < 5)
 }
 
 fn hour() -> f32 {

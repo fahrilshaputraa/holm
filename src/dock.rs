@@ -996,13 +996,12 @@ fn redraw_inner(hwnd: HWND) {
             }
         }
         if it.key == START_KEY {
-            // Tombol Windows: ubin aksen dengan logo 4 kotak (vektor).
-            let cr = sz * 0.22;
-            c.fill_round_rect(x, y, sz, sz, (cr, cr, cr, cr), config::color(&cfg.general.accent) | 0xFF00_0000);
-            let (side, gap) = (sz * 0.2, sz * 0.04);
+            // Tombol Windows: logo Windows 11 asli (4 kotak biru bergradasi, tanpa ubin latar).
+            let (side, gap) = (sz * 0.455, sz * 0.07);
             let (ox, oy) = (x + (sz - 2.0 * side - gap) / 2.0, y + (sz - 2.0 * side - gap) / 2.0);
-            for (dx, dy) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
-                c.fill_rect(ox + dx * (side + gap), oy + dy * (side + gap), side, side, 0xFFFF_FFFF);
+            let cols = [0xFF4CC2FFu32, 0xFF2FA6F7, 0xFF1C8DEF, 0xFF0A6FD1];
+            for (k, (dx, dy)) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)].into_iter().enumerate() {
+                c.fill_rect(ox + dx * (side + gap), oy + dy * (side + gap), side, side, cols[k]);
             }
         } else {
             ensure_icon(it);
@@ -1044,7 +1043,9 @@ fn redraw_inner(hwnd: HWND) {
     // Auto-hide: geser turun melewati tepi bawah layar dengan easing.
     let e = ease(shown);
     let slide = ((1.0 - e) * (wh + 8.0 * g.s)).round() as i32;
-    c.present(hwnd, Some((mon.x + ((mon.w as f32 - ww) / 2.0).round() as i32, dock_y(hwnd, wh) + slide)));
+    let (px, py) = (mon.x + ((mon.w as f32 - ww) / 2.0).round() as i32, dock_y(hwnd, wh) + slide);
+    clip_to_monitor(hwnd, ww as i32, wh as i32, py, mon.y + mon.h);
+    c.present(hwnd, Some((px, py)));
     with(hwnd, |w| {
         w.rects = rects;
         w.canvas = Some(c);
@@ -1054,6 +1055,30 @@ fn redraw_inner(hwnd: HWND) {
 fn ease(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+thread_local! {
+    static CLIP: RefCell<HashMap<isize, i32>> = RefCell::new(HashMap::new());
+}
+
+/// Saat Dock meluncur turun untuk bersembunyi, bagian yang melewati tepi bawah monitor dipotong agar tidak
+/// tampil di monitor tetangga (mis. monitor lain berada di bawahnya).
+fn clip_to_monitor(hwnd: HWND, w: i32, h: i32, y: i32, mon_bottom: i32) {
+    let visible = (mon_bottom - y).clamp(1, h);
+    let key = hwnd.0 as isize;
+    if CLIP.with(|c| c.borrow().get(&key).copied()) == Some(visible) {
+        return;
+    }
+    CLIP.with(|c| c.borrow_mut().insert(key, visible));
+    unsafe {
+        use windows::Win32::Graphics::Gdi::{CreateRectRgn, SetWindowRgn};
+        if visible >= h {
+            SetWindowRgn(hwnd, None, false);
+        } else {
+            let rgn = CreateRectRgn(0, 0, w, visible);
+            SetWindowRgn(hwnd, Some(rgn), false);
+        }
+    }
 }
 
 /// Posisi y jendela dock: menempel di bawah area yang disisakan AppBar (di atas taskbar bila ada).
@@ -1447,55 +1472,21 @@ fn activate(item: &Item) {
     }
 }
 
-/// Buka Start Menu Windows asli (pencarian, Pinned, Recent) dengan menekan tombol Win, lalu geser jendelanya
-/// ke atas Dock agar Dock tidak tertimpa (Windows menaruhnya rapat ke tepi bawah layar karena taskbar tersembunyi).
+/// Tombol Windows di Dock. Monitor utama: Start Menu Windows asli (tombol Win). Windows 11 hanya mampu membuka
+/// Start Menu di monitor utama (ia tidak punya jendela yang bisa dipindah), jadi di monitor tambahan tombol ini
+/// membuka pencarian aplikasi HolmBar di monitor itu.
 fn open_start_menu(dock: HWND) {
+    let primary = with(dock, |w| w.mon.primary).unwrap_or(true);
+    if !primary {
+        crate::popup::open_launcher();
+        return;
+    }
     let mk = |up: bool| INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VK_LWIN, wScan: 0, dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) }, time: 0, dwExtraInfo: 0 } },
     };
     unsafe {
         SendInput(&[mk(false), mk(true)], std::mem::size_of::<INPUT>() as i32);
-    }
-    let Some((_, py, _, _)) = pill_rect(dock) else { return };
-    let gap = with(dock, |w| (10.0 * w.mon.scale) as i32).unwrap_or(10);
-    let limit = py as i32 - gap; // Start Menu tidak boleh melewati garis ini
-    std::thread::spawn(move || {
-        // Animasi buka berlangsung ~300 ms dan shell bisa menempatkan ulang jendelanya: koreksi beberapa kali.
-        for delay in [120u64, 120, 150, 250] {
-            std::thread::sleep(std::time::Duration::from_millis(delay));
-            unsafe { raise_start_above(limit) };
-        }
-    });
-}
-
-unsafe fn raise_start_above(limit: i32) {
-    unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
-        let found = unsafe { &mut *(lparam.0 as *mut Option<HWND>) };
-        if unsafe { IsWindowVisible(hwnd) }.as_bool() {
-            let mut pid = 0u32;
-            unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-            let exe = exe_path_uncached(pid).unwrap_or_default().to_lowercase();
-            if exe.ends_with("startmenuexperiencehost.exe") || exe.ends_with("searchhost.exe") {
-                let mut r = RECT::default();
-                if unsafe { GetWindowRect(hwnd, &mut r) }.is_ok() && r.right - r.left > 400 && r.bottom - r.top > 300 {
-                    *found = Some(hwnd);
-                    return windows::core::BOOL(0);
-                }
-            }
-        }
-        windows::core::BOOL(1)
-    }
-    let mut found: Option<HWND> = None;
-    unsafe {
-        let _ = EnumWindows(Some(cb), LPARAM(&mut found as *mut _ as isize));
-        let Some(h) = found else { return };
-        let mut r = RECT::default();
-        if GetWindowRect(h, &mut r).is_err() || r.bottom <= limit {
-            return;
-        }
-        let up = r.bottom - limit;
-        let _ = SetWindowPos(h, None, r.left, r.top - up, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
 
