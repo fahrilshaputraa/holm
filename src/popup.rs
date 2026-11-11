@@ -22,6 +22,20 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 type Rect = (f32, f32, f32, f32);
 
+thread_local! {
+    /// Mode tangkapan dokumentasi: nama Wi-Fi / perangkat Bluetooth diganti nama contoh (privasi).
+    static DEMO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Teks sesuai bahasa config (`general.language`).
+fn tr(id: &'static str, en: &'static str) -> &'static str {
+    if config::current().general.language == "en" {
+        en
+    } else {
+        id
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kind {
     Calendar,
@@ -309,37 +323,40 @@ fn build_control(ui: &mut Ui, w: f32) -> f32 {
 
     // Konektivitas (kiri) + Jangan Ganggu / Proyeksi (kanan); hanya modul yang dipilih di Pengaturan.
     let (lw, row_h) = (inner * 0.58, 52.0 * s);
-    let wifi_on = radios::is_on(Which::Wifi);
-    let bt_on = radios::is_on(Which::Bluetooth);
+    let demo = DEMO.with(|d| d.get());
+    let wifi_on = if demo { Some(true) } else { radios::is_on(Which::Wifi) };
+    let bt_on = if demo { Some(true) } else { radios::is_on(Which::Bluetooth) };
     let air = control::airplane();
     let mut rows: Vec<(Icon, bool, &str, String, Hit, Hit)> = Vec::new();
     if on_m("wifi") {
         let ssid = WIFI.with(|v| v.borrow().nets.iter().find(|n| n.connected).map(|n| n.ssid.clone()));
+        let ssid = if DEMO.with(|d| d.get()) { Some("Home Wi-Fi".to_string()) } else { ssid };
         let sub = match wifi_on {
-            Some(true) => ssid.unwrap_or_else(|| "Menyala".into()),
-            Some(false) => "Mati".into(),
-            None => "Tidak tersedia".into(),
+            Some(true) => ssid.unwrap_or_else(|| tr("Menyala", "On").into()),
+            Some(false) => tr("Mati", "Off").into(),
+            None => tr("Tidak tersedia", "Unavailable").into(),
         };
         rows.push((Icon::Wifi, wifi_on == Some(true), "Wi-Fi", sub, Hit::CcWifi, Hit::CcWifiOpen));
     }
     if on_m("bluetooth") {
         let dev = radios::bt_devices().into_iter().find(|d| d.connected).map(|d| d.name);
+        let dev = if DEMO.with(|d| d.get()) { Some("AirBuds Pro".to_string()) } else { dev };
         let sub = match bt_on {
-            Some(true) => dev.unwrap_or_else(|| "Menyala".into()),
-            Some(false) => "Mati".into(),
-            None => "Tidak tersedia".into(),
+            Some(true) => dev.unwrap_or_else(|| tr("Menyala", "On").into()),
+            Some(false) => tr("Mati", "Off").into(),
+            None => tr("Tidak tersedia", "Unavailable").into(),
         };
         rows.push((Icon::Bluetooth, bt_on == Some(true), "Bluetooth", sub, Hit::CcBt, Hit::CcBtOpen));
     }
     if on_m("airplane") {
-        rows.push((Icon::Airplane, air, "Mode Pesawat", if air { "Menyala".into() } else { "Mati".into() }, Hit::CcAirplane, Hit::CcAirplane));
+        rows.push((Icon::Airplane, air, tr("Mode Pesawat", "Airplane Mode"), if air { tr("Menyala", "On").into() } else { tr("Mati", "Off").into() }, Hit::CcAirplane, Hit::CcAirplane));
     }
     let mut tiles: Vec<(Icon, bool, &str, &str, Hit)> = Vec::new();
     if on_m("dnd") {
-        tiles.push((Icon::Moon, control::dnd(), "Jangan", "Ganggu", Hit::CcDnd));
+        tiles.push((Icon::Moon, control::dnd(), tr("Jangan", "Do Not"), tr("Ganggu", "Disturb"), Hit::CcDnd));
     }
     if on_m("cast") {
-        tiles.push((Icon::Monitor, false, "Proyeksi", "", Hit::Uri("ms-settings-connectabledevices:devicediscovery")));
+        tiles.push((Icon::Monitor, false, tr("Proyeksi", "Cast"), "", Hit::Uri("ms-settings-connectabledevices:devicediscovery")));
     }
     let have_card = !rows.is_empty();
     let card_h = if have_card { row_h * rows.len().max(2) as f32 + 12.0 * s } else { 0.0 };
@@ -376,14 +393,14 @@ fn build_control(ui: &mut Ui, w: f32) -> f32 {
 
     // Kecerahan (hanya layar internal) dan suara.
     if let (true, Some(b)) = (on_m("display"), control::brightness()) {
-        cc_slider(ui, (pad, y, inner, 70.0 * s), "Layar", Icon::Sun, b as f32 / 100.0, Hit::CcBright, None);
+        cc_slider(ui, (pad, y, inner, 70.0 * s), tr("Layar", "Display"), Icon::Sun, b as f32 / 100.0, Hit::CcBright, None);
         y += 70.0 * s + gap;
     }
     if on_m("sound") {
         let v = status::volume().unwrap_or(status::Volume { level: 0.0, muted: false });
         let lvl = if v.muted { 0.0 } else { v.level };
         let sp = if v.muted || lvl <= 0.001 { 0 } else if lvl < 0.34 { 1 } else if lvl < 0.67 { 2 } else { 3 };
-        cc_slider(ui, (pad, y, inner, 70.0 * s), "Suara", Icon::Speaker(sp), lvl, Hit::CcVol, Some(Hit::VolMute));
+        cc_slider(ui, (pad, y, inner, 70.0 * s), tr("Suara", "Sound"), Icon::Speaker(sp), lvl, Hit::CcVol, Some(Hit::VolMute));
         y += 70.0 * s + gap;
     }
 
@@ -396,7 +413,7 @@ fn build_control(ui: &mut Ui, w: f32) -> f32 {
     let fy = y + 2.0 * s;
     if let Some((pct, charging)) = crate::bar::battery() {
         ui.ic(Icon::Battery(pct), (pad + 4.0 * s, fy + 3.0 * s, 20.0 * s, 20.0 * s), if charging { 0xFF30D158 } else if pct <= 20 { 0xFFFF453A } else { WHITE }, 0xFF1E1E22);
-        ui.text(&format!("{pct}%{}", if charging { "  ·  Mengisi" } else { "" }), (pad + 30.0 * s, fy, 150.0 * s, 26.0 * s), 12.0, false, DIM, Align::Near);
+        ui.text(&format!("{pct}%{}", if charging { tr("  ·  Mengisi", "  ·  Charging") } else { "" }), (pad + 30.0 * s, fy, 150.0 * s, 26.0 * s), 12.0, false, DIM, Align::Near);
     }
     let gr = (pad + inner - 28.0 * s, fy, 28.0 * s, 26.0 * s);
     if ui.hovered(Hit::CcSettings) {
@@ -673,7 +690,7 @@ fn build_calendar(ui: &mut Ui, w: f32, off: i32) -> f32 {
 fn build_volume(ui: &mut Ui, w: f32) -> f32 {
     let (s, pad) = (ui.s, 18.0 * ui.s);
     let v = status::volume().unwrap_or(status::Volume { level: 0.0, muted: false });
-    ui.text("Suara", (pad, pad, w - 2.0 * pad, 24.0 * s), 15.0, true, WHITE, Align::Near);
+    ui.text(tr("Suara", "Sound"), (pad, pad, w - 2.0 * pad, 24.0 * s), 15.0, true, WHITE, Align::Near);
 
     let y = pad + 44.0 * s;
     // Ikon speaker (klik = mute).
@@ -703,7 +720,7 @@ fn build_volume(ui: &mut Ui, w: f32) -> f32 {
     ui.text(&format!("{}%", (lvl * 100.0).round() as i32), (tx + tw + 8.0 * s, y - 12.0 * s, 40.0 * s, 24.0 * s), 12.0, false, DIM, Align::Far);
 
     let b = (pad, y + 28.0 * s, w - 2.0 * pad, 32.0 * s);
-    ui.button(b, "Pengaturan suara...", Hit::Uri("ms-settings:sound"));
+    ui.button(b, tr("Pengaturan suara...", "Sound settings..."), Hit::Uri("ms-settings:sound"));
     y + 28.0 * s + 32.0 * s + pad
 }
 
@@ -1047,6 +1064,20 @@ pub fn toggle(kind: Kind, anchor_x: f32, mon: Mon) {
         let _ = ShowWindow(h, SW_SHOW);
         let _ = SetForegroundWindow(h);
     }
+}
+
+/// Simpan gambar popup `kind` ke `path` (untuk dokumentasi): dibuka sekejap lalu ditutup lagi.
+pub fn shot(kind: Kind, mon: Mon, path: std::path::PathBuf, demo: bool) {
+    if is_open(kind) {
+        hide();
+    }
+    DEMO.with(|d| d.set(demo));
+    with(|p| p.last_closed = None);
+    crate::canvas::capture_next(path);
+    toggle(kind, mon.x as f32 + mon.w as f32 - 200.0 * mon.scale, mon);
+    hide();
+    with(|p| p.last_closed = None);
+    DEMO.with(|d| d.set(false));
 }
 
 /// Buka peluncur di monitor tempat kursor berada (hotkey / menu).

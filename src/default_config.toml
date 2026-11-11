@@ -14,6 +14,7 @@ monitors = "all"             # "all" | "primary"
 height = 32
 background = "#18181B"
 opacity = 0.90
+transparent = false          # true = bar tembus pandang (tanpa latar), teks diberi bayangan agar tetap terbaca
 text = "#FFFFFF"
 dim_text = "#E2E2E6"
 font = "Segoe UI Variable Text"   

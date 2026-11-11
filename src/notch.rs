@@ -374,6 +374,11 @@ struct State {
     n_target: bool,
     notif: Option<Toast>,
     notif_img: Option<Image>,
+    /// Ikon aplikasi kecil di sudut gambar utama (saat gambar utama = avatar dari banner).
+    notif_badge: Option<Image>,
+    /// Warna dominan ikon kartu (garis hitung mundur) dan saat hitung mundur dimulai.
+    notif_tint: Option<u32>,
+    notif_at: Option<Instant>,
     queue: VecDeque<Toast>,
     hover: bool,
     tab: Tab,
@@ -426,6 +431,9 @@ pub fn attach(hwnd: HWND, mon: Mon) {
                 n_target: false,
                 notif: None,
                 notif_img: None,
+                notif_badge: None,
+                notif_tint: None,
+                notif_at: None,
                 queue: VecDeque::new(),
                 hover: false,
                 tab,
@@ -474,9 +482,10 @@ fn is_settled_open(hwnd: HWND) -> bool {
 /// Pilih interval gambar ulang sesuai apa yang sedang bergerak; 0 = mati.
 fn sync_tick(hwnd: HWND) {
     let info = media::info();
-    let Some((open, tab, anim, cur, call, idle, born, battery)) = with(hwnd, |st| {
+    let Some((open, tab, anim, cur, call, idle, born, battery, counting)) = with(hwnd, |st| {
         let call = st.n_target && st.notif.as_ref().map(|t| t.kind == Kind::Call).unwrap_or(false);
-        (st.target_open && st.x > 0.9, st.tab, st.v.abs() > 0.0 || (st.nt > 0.0 && !call), st.tick_ms, call, st.idle && st.x < 0.05 && st.nt < 0.01, st.born, st.sys.battery)
+        let counting = st.n_target && !st.hover && st.notif.as_ref().map(|t| t.kind == Kind::Message).unwrap_or(false);
+        (st.target_open && st.x > 0.9, st.tab, st.v.abs() > 0.0, st.tick_ms, call, st.idle && st.x < 0.05 && st.nt < 0.01, st.born, st.sys.battery, counting)
     }) else {
         return;
     };
@@ -488,6 +497,9 @@ fn sync_tick(hwnd: HWND) {
     }
     if call {
         need(33); // denyut tombol terima
+    }
+    if counting {
+        need(40); // garis hitung mundur kartu notifikasi
     }
     if idle && crate::idle::enabled() {
         let ms = crate::idle::next_tick_ms(born.elapsed().as_secs_f32(), battery);
@@ -624,34 +636,49 @@ fn lyric_line(info: &MediaInfo) -> Option<String> {
 
 /// Tinggi isi tiap tab (sebelum dipusatkan vertikal).
 const CONTENT_H: f32 = 84.0;
+/// Kartu isi: jarak dari tepi notch, jarak antar kartu, ruang dalam (atas/bawah), dan warna permukaannya.
+const CARD_MARGIN: f32 = 12.0;
+const CARD_GAP: f32 = 8.0;
+const CARD_PAD: f32 = 9.0;
+const CARD: u32 = 0x14FFFFFF;
+const CARD_HOVER: u32 = 0x22FFFFFF;
+
+/// Permukaan kartu membulat di sekitar area isi selebar `w` mulai `x0` (isi mulai di `y0`).
+fn card(x: &Ctx, x0: f32, w: f32, y0: f32, col: u32) -> Rect {
+    let s = x.s;
+    let r = (x0, y0 - CARD_PAD * s, w, (CONTENT_H + 2.0 * CARD_PAD) * s);
+    x.round(r, 16.0, col);
+    r
+}
 
 /// Tab Beranda: media (sampul + badge aplikasi sumber + kontrol) | kalender mini | pintasan Timer.
 #[allow(clippy::too_many_arguments)]
 fn draw_media(x: &mut Ctx, art: Option<&Image>, source: Option<&(String, Image)>, info: &MediaInfo, bx: f32, bw: f32, y0: f32, has_cal: bool, has_timer: bool) -> Rect {
     let s = x.s;
-    let pad = 18.0 * s;
-    let inner = bw - 2.0 * pad;
-    let tile_w = 92.0 * s;
-    let cal_w = 176.0 * s;
-    let media_w = inner - cal_w - tile_w;
-    let ax = bx + pad;
-    let media_end = ax + media_w - 14.0 * s;
+    let (m, gap) = (CARD_MARGIN * s, CARD_GAP * s);
+    let tile_w = 96.0 * s;
+    let cal_w = 184.0 * s;
+    let media_w = bw - 2.0 * m - 2.0 * gap - cal_w - tile_w;
+    let media_x = bx + m;
+    card(x, media_x, media_w, y0, CARD);
+    let ax = media_x + 10.0 * s;
+    let media_end = media_x + media_w - 12.0 * s;
 
     // --- Media ---
-    let art_s = 76.0 * s;
+    let art_s = CONTENT_H * s;
     match art {
-        Some(img) => x.c.draw_image(img, ax, y0, art_s, art_s, 14.0 * s, x.fade),
+        Some(img) => x.c.draw_image(img, ax, y0, art_s, art_s, 12.0 * s, x.fade),
         None => {
-            x.round((ax, y0, art_s, art_s), 14.0, 0xFF232328);
+            x.round((ax, y0, art_s, art_s), 12.0, 0xFF1C1C21);
             x.icon(Icon::Music, (ax, y0, art_s, art_s), 30.0, if info.active { x.tint } else { 0xFF55555F });
         }
     }
     // Badge aplikasi sumber di sudut kanan bawah sampul (seperti logo Apple Music/Spotify).
     if let (true, Some((_, icon))) = (info.active, source) {
-        let b = 26.0 * s;
-        let (bxx, byy) = (ax + art_s - b + 6.0 * s, y0 + art_s - b + 6.0 * s);
-        x.round((bxx - 2.0 * s, byy - 2.0 * s, b + 4.0 * s, b + 4.0 * s), 9.0, x.bg | 0xFF00_0000);
-        x.c.draw_image(icon, bxx, byy, b, b, 7.0 * s, x.fade);
+        let b = 24.0 * s;
+        let (bxx, byy) = (ax + art_s - b + 5.0 * s, y0 + art_s - b + 5.0 * s);
+        x.round((bxx - 2.0 * s, byy - 2.0 * s, b + 4.0 * s, b + 4.0 * s), 8.0, 0xFF141416);
+        x.c.draw_image(icon, bxx, byy, b, b, 6.0 * s, x.fade);
     }
     let tx = ax + art_s + 14.0 * s;
     let tw = (media_end - tx).max(40.0 * s);
@@ -660,21 +687,21 @@ fn draw_media(x: &mut Ctx, art: Option<&Image>, source: Option<&(String, Image)>
     } else {
         (tr("Tidak ada media", "Nothing playing").to_string(), tr("Putar musik untuk mengontrolnya", "Play something to control it here").to_string())
     };
-    x.text(&title, (tx, y0 + 2.0 * s, tw, 20.0 * s), 15.0, true, 0xFFFFFFFF, Align::Near);
-    x.text(&artist, (tx, y0 + 22.0 * s, tw, 17.0 * s), 12.5, false, DIM, Align::Near);
+    x.text(&title, (tx, y0 + 3.0 * s, tw, 20.0 * s), 15.0, true, 0xFFFFFFFF, Align::Near);
+    x.text(&artist, (tx, y0 + 23.0 * s, tw, 17.0 * s), 12.5, false, DIM, Align::Near);
     if info.active {
         match lyric_line(info) {
-            Some(line) => x.text(&line, (tx, y0 + 39.0 * s, tw, 16.0 * s), 12.0, false, 0xD8FFFFFF, Align::Near),
+            Some(line) => x.text(&line, (tx, y0 + 40.0 * s, tw, 16.0 * s), 12.0, false, 0xD8FFFFFF, Align::Near),
             None => {
                 if let Some((name, _)) = source {
-                    x.text(&format!("{} {name}", tr("dari", "from")), (tx, y0 + 39.0 * s, tw, 16.0 * s), 11.5, false, x.tint, Align::Near);
+                    x.text(&format!("{} {name}", tr("dari", "from")), (tx, y0 + 40.0 * s, tw, 16.0 * s), 11.5, false, x.tint, Align::Near);
                 }
             }
         }
     }
 
     // Kontrol di bawah teks, lalu progres di sebelahnya (klik untuk lompat).
-    let cy = y0 + art_s - 12.0 * s;
+    let cy = y0 + art_s - 13.0 * s;
     let ctrl = if info.active { 0xFFFFFFFF } else { 0xFF55555F };
     let play_icon = if info.playing { Icon::Pause } else { Icon::Play };
     x.button(tx + 11.0 * s, cy, 28.0 * s, Icon::Prev, 15.0, ctrl, Hit::Prev);
@@ -697,20 +724,18 @@ fn draw_media(x: &mut Ctx, art: Option<&Image>, source: Option<&(String, Image)>
         x.hit((bx2 - 4.0 * s, by - 8.0 * s, bw2 + 8.0 * s, bh + 16.0 * s), Hit::Seek);
     }
 
-    // --- Pemisah ---
-    let div = |x: &Ctx, at: f32| x.c.fill_rect(at, y0 + 6.0 * s, 1.0 * s, CONTENT_H * s - 12.0 * s, x.a(0x1FFFFFFF));
-    let cal_x = ax + media_w;
-    div(x, cal_x - 8.0 * s);
-
     // --- Kalender mini: bulan, 5 hari di sekitar hari ini, jam ---
+    let cal_x = media_x + media_w + gap;
+    let cal_hit = Hit::Tab(Tab::Calendar);
+    card(x, cal_x, cal_w, y0, if has_cal && x.hovered(cal_hit) { CARD_HOVER } else { CARD });
     let n = names();
     let now = unsafe { GetLocalTime() };
     let today = days_from_civil(now.wYear as i64, now.wMonth as u32, now.wDay as u32);
-    let cx0 = cal_x + 8.0 * s;
+    let cx0 = cal_x + 12.0 * s;
     let cw = cal_w - 24.0 * s;
     let month = &n.months[now.wMonth as usize - 1];
-    x.text(&month.chars().take(3).collect::<String>(), (cx0, y0, cw, 20.0 * s), 15.0, true, 0xFFFFFFFF, Align::Near);
-    x.text(n.days_long[weekday(today)], (cx0, y0, cw, 20.0 * s), 11.5, false, x.tint, Align::Far);
+    x.text(month, (cx0, y0 + 1.0 * s, cw, 20.0 * s), 14.0, true, 0xFFFFFFFF, Align::Near);
+    x.text(&clock_text(), (cx0, y0 + 1.0 * s, cw, 20.0 * s), 12.0, true, x.tint, Align::Far);
     let col = cw / 5.0;
     for i in 0..5 {
         let day = today - 2 + i as i64;
@@ -718,38 +743,38 @@ fn draw_media(x: &mut Ctx, art: Option<&Image>, source: Option<&(String, Image)>
         let cxx = cx0 + col * i as f32;
         let is_today = i == 2;
         let wd = n.days_short[weekday(day)];
-        x.text(&wd.chars().take(2).collect::<String>(), (cxx, y0 + 24.0 * s, col, 13.0 * s), 10.0, is_today, if is_today { 0xFFFFFFFF } else { 0xFF6E6E78 }, Align::Center);
-        let r = (cxx + (col - 26.0 * s) / 2.0, y0 + 39.0 * s, 26.0 * s, 26.0 * s);
+        x.text(wd, (cxx, y0 + 27.0 * s, col, 13.0 * s), 10.0, is_today, if is_today { 0xFFFFFFFF } else { 0xFF7C7C86 }, Align::Center);
+        let r = (cxx + (col - 28.0 * s) / 2.0, y0 + 46.0 * s, 28.0 * s, 28.0 * s);
         if is_today {
             x.c.fill_ellipse(r.0, r.1, r.2, r.3, x.a(x.tint));
         }
-        x.text(&d.to_string(), r, 13.0, is_today, if is_today { 0xFFFFFFFF } else { 0xFFD8D8DE }, Align::Center);
+        x.text(&d.to_string(), r, 13.0, is_today, if is_today { 0xFF101014 } else { 0xFFD8D8DE }, Align::Center);
     }
-    x.text(&format!("{}  ·  {} {}", clock_text(), now.wDay, month), (cx0, y0 + 68.0 * s, cw, 16.0 * s), 11.0, false, DIM, Align::Near);
     if has_cal {
-        x.hit((cal_x, y0, cal_w - 16.0 * s, CONTENT_H * s), Hit::Tab(Tab::Calendar));
+        x.hit((cal_x, y0 - CARD_PAD * s, cal_w, (CONTENT_H + 2.0 * CARD_PAD) * s), cal_hit);
     }
-    div(x, cal_x + cal_w - 8.0 * s);
 
-    // --- Pintasan Timer (lingkaran seperti tombol "Mirror") ---
-    let d = 72.0 * s;
-    let tcx = bx + bw - pad - tile_w / 2.0 + 4.0 * s;
-    let tcy = y0 + CONTENT_H * s / 2.0;
-    let tr_ = (tcx - d / 2.0, tcy - d / 2.0, d, d);
+    // --- Pintasan Timer: seluruh kartu adalah tombol ---
+    let tile_x = cal_x + cal_w + gap;
     let hit = if has_timer { Hit::Tab(Tab::Timer) } else { Hit::ClockToggle };
-    x.c.fill_ellipse(tr_.0, tr_.1, tr_.2, tr_.3, x.a(if x.hovered(hit) { 0xFF34343B } else { 0xFF26262B }));
+    let tile = card(x, tile_x, tile_w, y0, if x.hovered(hit) { CARD_HOVER } else { CARD });
+    let (tcx, tcy) = (tile_x + tile_w / 2.0, y0 + CONTENT_H * s / 2.0);
     let (active, running, stopwatch, text) = clock(|c| (c.active(), c.running(), c.stopwatch, c.text(false)));
-    let col = if active { if stopwatch { 0xFFFFFFFF } else { TIMER_COLOR } } else { 0xFFB4B4BE };
-    x.icon(Icon::Stopwatch, (tcx - 12.0 * s, tcy - 22.0 * s, 24.0 * s, 24.0 * s), 22.0, col);
+    let col = if active { if stopwatch { 0xFFFFFFFF } else { TIMER_COLOR } } else { 0xFFC8C8D0 };
+    let d = 40.0 * s;
+    x.c.fill_ellipse(tcx - d / 2.0, tcy - d / 2.0 - 11.0 * s, d, d, x.a(config::with_alpha(col, if active { 0.22 } else { 0.10 })));
+    x.icon(Icon::Stopwatch, (tcx - d / 2.0, tcy - d / 2.0 - 11.0 * s, d, d), 19.0, col);
     let label = if active { text } else { "Timer".to_string() };
-    x.text(&label, (tr_.0, tcy + 6.0 * s, d, 16.0 * s), if active { 12.5 } else { 11.5 }, active && running, col, Align::Center);
-    x.hit(tr_, hit);
+    x.text(&label, (tile_x, tcy + 17.0 * s, tile_w, 17.0 * s), if active { 12.5 } else { 11.5 }, active && running, if active { col } else { DIM }, Align::Center);
+    x.hit(tile, hit);
     bar
 }
 
 fn draw_calendar(x: &mut Ctx, bx: f32, bw: f32, y0: f32, week_off: i64) {
     let s = x.s;
-    let pad = 20.0 * s;
+    let pad = (CARD_MARGIN + 16.0) * s;
+    card(x, bx + CARD_MARGIN * s, 150.0 * s, y0, CARD);
+    card(x, bx + (CARD_MARGIN + 150.0 + CARD_GAP) * s, bw - (2.0 * CARD_MARGIN + 150.0 + CARD_GAP) * s, y0, CARD);
     let n = names();
     let now = unsafe { GetLocalTime() };
     let today = days_from_civil(now.wYear as i64, now.wMonth as u32, now.wDay as u32);
@@ -757,14 +782,14 @@ fn draw_calendar(x: &mut Ctx, bx: f32, bw: f32, y0: f32, week_off: i64) {
 
     // Kiri: tanggal besar.
     let lx = bx + pad;
-    x.text(n.days_long[wd], (lx, y0, 120.0 * s, 16.0 * s), 12.5, true, x.tint, Align::Near);
-    x.text(&now.wDay.to_string(), (lx - 2.0 * s, y0 + 14.0 * s, 120.0 * s, 42.0 * s), 34.0, true, 0xFFFFFFFF, Align::Near);
+    x.text(n.days_long[wd], (lx, y0 + 2.0 * s, 118.0 * s, 16.0 * s), 12.5, true, x.tint, Align::Near);
+    x.text(&now.wDay.to_string(), (lx - 2.0 * s, y0 + 16.0 * s, 118.0 * s, 42.0 * s), 34.0, true, 0xFFFFFFFF, Align::Near);
     let my = format!("{} {}", n.months[now.wMonth as usize - 1], now.wYear);
-    x.text(&my, (lx, y0 + 56.0 * s, 130.0 * s, 16.0 * s), 11.5, false, DIM, Align::Near);
+    x.text(&my, (lx, y0 + 60.0 * s, 118.0 * s, 16.0 * s), 11.5, false, DIM, Align::Near);
 
     // Kanan: strip satu minggu (Senin–Minggu) dengan navigasi.
-    let gx = lx + 150.0 * s;
-    let gw = bx + bw - pad - gx;
+    let gx = bx + (CARD_MARGIN + 150.0 + CARD_GAP + 12.0) * s;
+    let gw = bx + bw - (CARD_MARGIN + 12.0) * s - gx;
     let monday = today - wd as i64 + week_off * 7;
     let col = gw / 7.0;
     for i in 0..7 {
@@ -778,16 +803,16 @@ fn draw_calendar(x: &mut Ctx, bx: f32, bw: f32, y0: f32, week_off: i64) {
         if is_today {
             x.c.fill_ellipse(r.0, r.1, r.2, r.3, x.a(x.tint));
         }
-        let colr = if is_today { 0xFFFFFFFF } else if m != now.wMonth as u32 { 0xFF6E6E78 } else { 0xFFE6E6EA };
+        let colr = if is_today { 0xFF101014 } else if m != now.wMonth as u32 { 0xFF6E6E78 } else { 0xFFE6E6EA };
         x.text(&d.to_string(), r, 13.5, is_today, colr, Align::Center);
     }
     let (_, m0, d0) = civil_from_days(monday);
     let (_, m1, d1) = civil_from_days(monday + 6);
     let range = if m0 == m1 { format!("{d0}–{d1} {}", n.months[m1 as usize - 1]) } else { format!("{d0} {} – {d1} {}", &n.months[m0 as usize - 1][..3], &n.months[m1 as usize - 1][..3]) };
-    let ny = y0 + 62.0 * s;
+    let ny = y0 + 68.0 * s;
     x.button(gx + 10.0 * s, ny, 22.0 * s, Icon::ChevronLeft, 11.0, DIM, Hit::WeekPrev);
     let label_r = (gx + 24.0 * s, ny - 8.0 * s, gw - 48.0 * s, 16.0 * s);
-    let label = if week_off == 0 { range } else { format!("{range}  ·  Hari ini") };
+    let label = if week_off == 0 { range } else { format!("{range}  ·  {}", tr("Hari ini", "Today")) };
     x.text(&label, label_r, 11.0, false, if x.hovered(Hit::WeekToday) { 0xFFFFFFFF } else { DIM }, Align::Center);
     if week_off != 0 {
         x.hit(label_r, Hit::WeekToday);
@@ -797,20 +822,21 @@ fn draw_calendar(x: &mut Ctx, bx: f32, bw: f32, y0: f32, week_off: i64) {
 
 fn draw_timer(x: &mut Ctx, bx: f32, bw: f32, y0: f32) {
     let s = x.s;
-    let pad = 20.0 * s;
+    let pad = (CARD_MARGIN + 16.0) * s;
+    card(x, bx + CARD_MARGIN * s, bw - 2.0 * CARD_MARGIN * s, y0, CARD);
     let (stopwatch, running, alarm, text) = clock(|c| (c.stopwatch, c.running(), c.alarm(), c.text(true)));
     let color = if stopwatch { 0xFFFFFFFF } else { TIMER_COLOR };
     let lx = bx + pad;
-    let big = if alarm { "Waktu habis".to_string() } else { text };
+    let big = if alarm { tr("Waktu habis", "Time's up").to_string() } else { text };
     x.text(&big, (lx, y0 - 2.0 * s, 220.0 * s, 44.0 * s), if alarm { 24.0 } else { 34.0 }, true, color, Align::Near);
 
     // Pilihan mode.
     let seg = (lx, y0 + 48.0 * s, 176.0 * s, 26.0 * s);
-    x.round(seg, 8.0, 0xFF26262B);
+    x.round(seg, 9.0, 0x1AFFFFFF);
     for (j, (label, sw)) in [("Timer", false), ("Stopwatch", true)].into_iter().enumerate() {
         let r = (seg.0 + 2.0 * s + j as f32 * (seg.2 - 4.0 * s) / 2.0, seg.1 + 2.0 * s, (seg.2 - 4.0 * s) / 2.0, seg.3 - 4.0 * s);
         if sw == stopwatch {
-            x.round(r, 6.0, 0xFF48484F);
+            x.round(r, 7.0, 0x3DFFFFFF);
         } else if x.hovered(Hit::Mode(sw)) {
             x.round(r, 6.0, 0x1AFFFFFF);
         }
@@ -827,7 +853,7 @@ fn draw_timer(x: &mut Ctx, bx: f32, bw: f32, y0: f32) {
     x.icon(if running { Icon::Pause } else { Icon::Play }, main, 17.0, color);
     x.hit(main, Hit::ClockToggle);
     let reset = (main.0 - d - 10.0 * s, main.1, d, d);
-    x.c.fill_ellipse(reset.0, reset.1, reset.2, reset.3, x.a(if x.hovered(Hit::ClockReset) { 0xFF4A4A52 } else { 0xFF333339 }));
+    x.c.fill_ellipse(reset.0, reset.1, reset.2, reset.3, x.a(if x.hovered(Hit::ClockReset) { 0x40FFFFFF } else { 0x24FFFFFF }));
     x.icon(Icon::Reset, reset, 17.0, 0xFFFFFFFF);
     x.hit(reset, Hit::ClockReset);
 
@@ -837,7 +863,7 @@ fn draw_timer(x: &mut Ctx, bx: f32, bw: f32, y0: f32) {
         let mut cx = rx - presets.len() as f32 * (cw + 6.0 * s) + 6.0 * s;
         for (min, label) in presets {
             let r = (cx, y0 + 48.0 * s, cw, 26.0 * s);
-            x.round(r, 13.0, if x.hovered(Hit::Preset(min)) { 0xFF46464E } else { 0xFF2C2C32 });
+            x.round(r, 13.0, if x.hovered(Hit::Preset(min)) { 0x40FFFFFF } else { 0x1FFFFFFF });
             x.text(label, r, 11.5, false, 0xFFE6E6EA, Align::Center);
             x.hit(r, Hit::Preset(min));
             cx += cw + 6.0 * s;
@@ -845,28 +871,37 @@ fn draw_timer(x: &mut Ctx, bx: f32, bw: f32, y0: f32) {
     }
 }
 
-fn gauge(x: &Ctx, cx: f32, cy: f32, frac: f32, color: u32, value: &str, label: &str) {
+/// Kartu statistik: cincin persentase di kiri, nilai besar + keterangan di kanan.
+fn gauge(x: &Ctx, r: Rect, frac: f32, color: u32, value: &str, label: &str, detail: &str) {
     let s = x.s;
-    let r = 22.0 * s;
-    x.c.stroke_arc(cx, cy, r, 0.0, 360.0, 5.0 * s, x.a(0x2EFFFFFF));
-    x.c.stroke_arc(cx, cy, r, -90.0, 360.0 * frac.clamp(0.0, 1.0), 5.0 * s, x.a(color));
-    x.text(value, (cx - r, cy - r, 2.0 * r, 2.0 * r), 11.5, true, 0xFFFFFFFF, Align::Center);
-    x.text(label, (cx - 60.0 * s, cy + r + 6.0 * s, 120.0 * s, 15.0 * s), 11.0, false, DIM, Align::Center);
+    let rad = 25.0 * s;
+    let (cx, cy) = (r.0 + 18.0 * s + rad, r.1 + r.3 / 2.0);
+    x.c.stroke_arc(cx, cy, rad, 0.0, 360.0, 5.0 * s, x.a(0x24FFFFFF));
+    x.c.stroke_arc(cx, cy, rad, -90.0, 360.0 * frac.clamp(0.0, 1.0), 5.0 * s, x.a(color));
+    x.text(value, (cx - rad, cy - rad, 2.0 * rad, 2.0 * rad), 12.0, true, 0xFFFFFFFF, Align::Center);
+    let tx = cx + rad + 14.0 * s;
+    let tw = (r.0 + r.2 - 10.0 * s - tx).max(10.0);
+    x.text(label, (tx, cy - 19.0 * s, tw, 20.0 * s), 14.0, true, 0xFFFFFFFF, Align::Near);
+    x.text(detail, (tx, cy + 1.0 * s, tw, 17.0 * s), 11.5, false, DIM, Align::Near);
 }
 
 fn draw_system(x: &mut Ctx, sys: &Sys, bx: f32, bw: f32, y0: f32) {
     let s = x.s;
-    let cy = y0 + 26.0 * s;
-    let mut items: Vec<(f32, u32, String, String)> = Vec::new();
+    // (persentase, warna, nilai, judul, keterangan)
+    let mut items: Vec<(f32, u32, String, String, String)> = Vec::new();
     if let Some((pct, charging)) = sys.battery {
-        let col = if charging { 0xFF30D158 } else if pct <= 20 { 0xFFFF453A } else { 0xFF30D158 };
-        items.push((pct as f32 / 100.0, col, format!("{pct}%"), if charging { "Mengisi daya".into() } else { "Baterai".into() }));
+        let col = if !charging && pct <= 20 { RED } else { GREEN };
+        let detail = if charging { tr("Mengisi daya", "Charging") } else if pct <= 20 { tr("Hampir habis", "Running low") } else { tr("Memakai baterai", "On battery") };
+        items.push((pct as f32 / 100.0, col, format!("{pct}%"), tr("Baterai", "Battery").into(), detail.into()));
     }
-    items.push((sys.cpu, 0xFF0A84FF, format!("{:.0}%", sys.cpu * 100.0), "CPU".into()));
-    items.push((sys.ram, 0xFFBF5AF2, format!("{:.0}%", sys.ram * 100.0), format!("RAM {:.1}/{:.0} GB", sys.ram_used_gb, sys.ram_total_gb)));
-    let col_w = bw / items.len() as f32;
-    for (i, (frac, color, value, label)) in items.iter().enumerate() {
-        gauge(x, bx + col_w * (i as f32 + 0.5), cy, *frac, *color, value, label);
+    let load = if sys.cpu > 0.8 { tr("Beban tinggi", "Heavy load") } else if sys.cpu > 0.4 { tr("Beban sedang", "Moderate load") } else { tr("Beban ringan", "Light load") };
+    items.push((sys.cpu, 0xFF0A84FF, format!("{:.0}%", sys.cpu * 100.0), "CPU".into(), load.into()));
+    items.push((sys.ram, 0xFFBF5AF2, format!("{:.0}%", sys.ram * 100.0), tr("Memori", "Memory").into(), format!("{:.1} / {:.0} GB", sys.ram_used_gb, sys.ram_total_gb)));
+    let (m, gap) = (CARD_MARGIN * s, CARD_GAP * s);
+    let cw = (bw - 2.0 * m - gap * (items.len() as f32 - 1.0)) / items.len() as f32;
+    for (i, (frac, color, value, label, detail)) in items.iter().enumerate() {
+        let r = card(x, bx + m + (cw + gap) * i as f32, cw, y0, CARD);
+        gauge(x, r, *frac, *color, value, label, detail);
     }
 }
 
@@ -998,7 +1033,7 @@ fn notif_dims(s: f32, ch: f32, kind: Option<Kind>) -> (f32, f32) {
     match kind {
         Some(Kind::Call) => (450.0 * s, (80.0 * s).max(ch + 24.0 * s)),
         Some(Kind::Bluetooth { .. }) | Some(Kind::Charging { .. }) => (380.0 * s, (60.0 * s).max(ch + 24.0 * s)),
-        _ => (410.0 * s, (64.0 * s).max(ch + 24.0 * s)),
+        _ => (430.0 * s, (72.0 * s).max(ch + 24.0 * s)),
     }
 }
 
@@ -1014,7 +1049,10 @@ fn monogram(c: &Canvas, toast: &Toast, r: Rect, radius: f32, accent: u32, font: 
 #[allow(clippy::too_many_arguments)]
 fn draw_notif(hwnd: HWND, c: &Canvas, body_w: f32, ear: f32, ch: f32, s: f32, fade: f32, font: &str, accent: u32, bg: u32, t_anim: f32) -> Vec<(Rect, Hit)> {
     let cfg = config::current();
-    let Some((toast, hover, hit)) = with(hwnd, |st| st.notif.clone().map(|t| (t, st.hover, st.hover_hit))).flatten() else { return Vec::new() };
+    let Some((toast, hover, hit, queued, tint, started)) = with(hwnd, |st| st.notif.clone().map(|t| (t, st.hover, st.hover_hit, st.queue.len(), st.notif_tint.unwrap_or(accent), st.notif_at))).flatten() else { return Vec::new() };
+    // Sisa waktu tampil (1 = baru muncul, 0 = habis); berhenti di penuh saat kursor di atas kartu.
+    let dur = cfg.notifications.duration_ms.max(1000) as f32;
+    let remain = if hover { 1.0 } else { started.map(|t| 1.0 - t.elapsed().as_millis() as f32 / dur).unwrap_or(1.0).clamp(0.0, 1.0) };
     let mut x = Ctx { c, s, font: font.to_string(), fade, tint: accent, bg, hover: hit, rects: Vec::new() };
     let a = |col: u32| config::with_alpha(col, fade * ((col >> 24) as f32 / 255.0));
     let (_, nh) = notif_dims(s, ch, Some(toast.kind));
@@ -1028,30 +1066,61 @@ fn draw_notif(hwnd: HWND, c: &Canvas, body_w: f32, ear: f32, ch: f32, s: f32, fa
 
     match toast.kind {
         Kind::Message => {
-            let isz = 42.0 * s;
-            let ir = (left, cy - isz / 2.0, isz, isz);
-            if !draw_img(ir, 11.0 * s) {
-                monogram(c, &toast, ir, 11.0 * s, accent, font, s, &a);
+            // Ikon asli aplikasi (atau avatar dari banner dengan badge ikon aplikasi di sudutnya).
+            let isz = 44.0 * s;
+            let ir = (left - 2.0 * s, cy - isz / 2.0 - 2.0 * s, isz, isz);
+            if !draw_img(ir, 12.0 * s) {
+                monogram(c, &toast, ir, 12.0 * s, accent, font, s, &a);
             }
-            let tx = left + isz + 13.0 * s;
-            let app = if toast.app.is_empty() { tr("Notifikasi", "Notification").to_string() } else { toast.app.clone() };
-            let meta = format!("{app}  ·  {}", tr("sekarang", "now"));
-            let meta_w = crate::canvas::measure(&meta, &Font::new(font, 11.0 * s, false)) + 2.0 * s;
-            let tw = (right - tx).max(10.0);
-            let title_w = (tw - meta_w - 10.0 * s).max(40.0 * s);
-            x.text(&toast.title, (tx, cy - 20.0 * s, title_w, 20.0 * s), 14.5, true, 0xFFFFFFFF, Align::Near);
+            let b = 20.0 * s;
+            let (bx, by) = (ir.0 + isz - b + 5.0 * s, ir.1 + isz - b + 5.0 * s);
+            let has_badge = with(hwnd, |st| st.notif_badge.is_some()).unwrap_or(false);
+            if has_badge {
+                c.fill_round_rect(bx - 2.0 * s, by - 2.0 * s, b + 4.0 * s, b + 4.0 * s, (7.0 * s, 7.0 * s, 7.0 * s, 7.0 * s), a(bg | 0xFF00_0000));
+                with(hwnd, |st| {
+                    if let Some(i) = st.notif_badge.as_ref() {
+                        c.draw_image(i, bx, by, b, b, 5.5 * s, fade);
+                    }
+                });
+            }
+            let tx = ir.0 + isz + 14.0 * s;
+            // Kanan: tombol tutup saat hover, selain itu jumlah notifikasi yang masih antre.
+            let mut text_end = right;
             if hover {
-                let d = 20.0 * s;
-                let r = (right - d, cy - 20.0 * s, d, d);
-                c.fill_ellipse(r.0, r.1, r.2, r.3, a(if hit == Some(Hit::NotifClose) { 0x55FFFFFF } else { 0x33FFFFFF }));
+                let d = 22.0 * s;
+                let r = (right - d + 2.0 * s, ir.1 - 1.0 * s, d, d);
+                c.fill_ellipse(r.0, r.1, r.2, r.3, a(if hit == Some(Hit::NotifClose) { 0x55FFFFFF } else { 0x26FFFFFF }));
                 x.icon(Icon::Close, r, 9.0, 0xFFFFFFFF);
                 x.hit(r, Hit::NotifClose);
-            } else {
-                x.text(&meta, (right - meta_w, cy - 20.0 * s, meta_w, 20.0 * s), 11.0, false, 0xFF8E8E98, Align::Far);
+                text_end = r.0 - 8.0 * s;
+            } else if queued > 0 {
+                let label = format!("+{queued}");
+                let lw = crate::canvas::measure(&label, &Font::new(font, 11.0 * s, true)) + 14.0 * s;
+                let r = (right - lw + 2.0 * s, ir.1 + 1.0 * s, lw, 18.0 * s);
+                x.round(r, 9.0, 0x24FFFFFF);
+                x.text(&label, r, 11.0, true, 0xFFD8D8DE, Align::Center);
+                text_end = r.0 - 8.0 * s;
             }
-            let body = if cfg.notifications.show_body { toast.body.as_str() } else { "" };
-            if !body.is_empty() {
-                x.text(body, (tx, cy + 1.0 * s, tw, 19.0 * s), 13.0, false, 0xFFB8B8C2, Align::Near);
+            let tw = (text_end - tx).max(10.0);
+            // Baris 1: judul tebal, lalu "· Aplikasi" redup (seperti "Nama · Aplikasi").
+            let title_font = Font::new(font, 14.0 * s, true);
+            let title_w = (crate::canvas::measure(&toast.title, &title_font) + 2.0 * s).min(tw);
+            let y1 = ir.1 + 2.0 * s;
+            x.text(&toast.title, (tx, y1, title_w, 20.0 * s), 14.0, true, 0xFFFFFFFF, Align::Near);
+            let app = if toast.app.is_empty() { tr("Notifikasi", "Notification").to_string() } else { toast.app.clone() };
+            let rest = tw - title_w - 6.0 * s;
+            if rest > 36.0 * s {
+                x.text(&format!("·  {app}"), (tx + title_w + 6.0 * s, y1 + 1.0 * s, rest, 19.0 * s), 12.0, false, 0xFF8E8E98, Align::Near);
+            }
+            // Baris 2: isi pesan (atau nama aplikasi bila isi disembunyikan).
+            let body = if cfg.notifications.show_body && !toast.body.is_empty() { toast.body.clone() } else { app };
+            x.text(&body, (tx, y1 + 21.0 * s, tw, 19.0 * s), 12.5, false, 0xFFB4B4BE, Align::Near);
+            // Garis hitung mundur: berapa lama lagi kartu tampil (penuh selama kursor di atas kartu).
+            let (py, ph, pw) = (nh - 8.0 * s, 2.0 * s, right - tx);
+            x.round((tx, py, pw, ph), 1.0, 0x1AFFFFFF);
+            let fill = (pw * remain).max(0.0);
+            if fill > ph {
+                x.round((tx, py, fill, ph), 1.0, config::with_alpha(tint, 0.9));
             }
         }
         Kind::Call => {
@@ -1133,6 +1202,24 @@ fn draw_notif(hwnd: HWND, c: &Canvas, body_w: f32, ear: f32, ch: f32, s: f32, fa
     x.rects
 }
 
+/// (gambar utama, badge) sebuah kartu. Ikon ASLI aplikasi pengirim dicari berurutan dari: indeks aplikasi
+/// terpasang (AppUserModelID -> ikon shell resolusi tinggi), logo UserNotificationListener, lalu shortcut
+/// Start Menu. Bila banner membawa gambar sendiri (avatar kontak), gambar itu jadi gambar utama dan ikon
+/// aplikasi menjadi badge kecil di sudutnya.
+fn toast_images(t: &Toast) -> (Option<Image>, Option<Image>) {
+    if !matches!(t.kind, Kind::Message | Kind::Call) {
+        return (None, None);
+    }
+    let app = crate::apps::aumid_for(&t.app)
+        .and_then(|id| crate::dock::aumid_icon(&id))
+        .or_else(|| t.icon.as_ref().and_then(|b| Image::from_bytes(b)))
+        .or_else(|| crate::popup::app_icon(&t.app));
+    match t.image.as_ref().and_then(|b| Image::from_bytes(b)) {
+        Some(avatar) => (Some(avatar), app),
+        None => (app, None),
+    }
+}
+
 /// Tampilkan banner notifikasi di notch ini (antre bila sedang menampilkan yang lain; maks 8).
 pub fn notify(hwnd: HWND, t: Toast) {
     let cfg = config::current();
@@ -1160,10 +1247,11 @@ fn advance_notif(hwnd: HWND) -> bool {
         }
         let Some(t) = st.queue.pop_front() else { return false };
         // Ikon asli: gambar banner bila tertangkap; kalau tidak, ikon aplikasi yang cocok dengan nama pengirim.
-        st.notif_img = match t.kind {
-            Kind::Message | Kind::Call => t.icon.as_ref().and_then(|b| Image::from_bytes(b)).or_else(|| crate::popup::app_icon(&t.app)),
-            _ => None,
-        };
+        let (img, badge) = toast_images(&t);
+        st.notif_tint = badge.as_ref().or(img.as_ref()).and_then(|i| i.tint());
+        st.notif_img = img;
+        st.notif_badge = badge;
+        st.notif_at = Some(Instant::now());
         st.notif = Some(t);
         st.n_target = true;
         st.hover = false;
@@ -1337,35 +1425,45 @@ pub fn redraw(hwnd: HWND) {
             let fade = ((t - 0.55) / 0.35).clamp(0.0, 1.0);
             let mut cx = Ctx { c, s, font: cfg.bar.font.clone(), fade, tint: tint_col, bg, hover, rects: Vec::new() };
 
-            // Strip atas: tab berlabel (pil) di kiri, Pengaturan di kanan.
+            // Strip atas: satu wadah pil berisi ikon tab (tab aktif melebar dengan labelnya), Pengaturan di kanan.
             let tabs = tabs();
-            let strip_c = ch / 2.0 + if pill { 3.0 * s } else { 1.0 * s };
+            let strip_c = ch / 2.0 + if pill { 4.0 * s } else { 2.0 * s };
+            let ph = (ch - 6.0 * s).min(22.0 * s);
             if tabs.len() > 1 {
-                let f = Font::new(&cfg.bar.font, 12.0 * s, true);
-                let mut tx = ear + 14.0 * s;
-                let ph = (ch - 6.0 * s).min(24.0 * s);
-                for tb in tabs.iter() {
-                    let lw = crate::canvas::measure(tb.label(), &f);
-                    let pw = 10.0 * s + 14.0 * s + 5.0 * s + lw + 11.0 * s;
+                let f = Font::new(&cfg.bar.font, 11.5 * s, true);
+                let icon_w = 30.0 * s;
+                let widths: Vec<f32> = tabs.iter().map(|tb| if *tb == tab { 28.0 * s + crate::canvas::measure(tb.label(), &f) + 12.0 * s } else { icon_w }).collect();
+                let total: f32 = widths.iter().sum::<f32>() + 2.0 * s * (tabs.len() as f32 - 1.0);
+                let x0 = ear + CARD_MARGIN * s;
+                cx.round((x0, strip_c - ph / 2.0 - 2.0 * s, total + 4.0 * s, ph + 4.0 * s), (ph / s + 4.0) / 2.0, CARD);
+                let mut tx = x0 + 2.0 * s;
+                for (tb, pw) in tabs.iter().zip(widths) {
                     let r = (tx, strip_c - ph / 2.0, pw, ph);
                     let on = *tb == tab;
                     if on {
-                        cx.round(r, ph / 2.0 / s, 0x33FFFFFF);
+                        cx.round(r, ph / 2.0 / s, 0x38FFFFFF);
                     } else if cx.hovered(Hit::Tab(*tb)) {
-                        cx.round(r, ph / 2.0 / s, 0x1AFFFFFF);
+                        cx.round(r, ph / 2.0 / s, 0x1CFFFFFF);
                     }
                     let col = if on { 0xFFFFFFFF } else { DIM };
-                    cx.icon(tb.icon(), (tx + 10.0 * s, r.1, 14.0 * s, ph), 13.0, col);
-                    cx.text(tb.label(), (tx + 29.0 * s, r.1, lw + 4.0 * s, ph), 12.0, true, col, Align::Near);
+                    if on {
+                        cx.icon(tb.icon(), (tx + 9.0 * s, r.1, 14.0 * s, ph), 13.0, col);
+                        cx.text(tb.label(), (tx + 28.0 * s, r.1, pw - 28.0 * s, ph), 11.5, true, col, Align::Near);
+                    } else {
+                        cx.icon(tb.icon(), r, 13.0, col);
+                    }
                     cx.hit(r, Hit::Tab(*tb));
-                    tx += pw + 4.0 * s;
+                    tx += pw + 2.0 * s;
                 }
             }
-            let d = (ch - 6.0 * s).min(26.0 * s);
-            cx.button(ear + body_w - 14.0 * s - d / 2.0, strip_c, d, Icon::Gear, 14.0, DIM, Hit::Settings);
+            let d = ph + 4.0 * s;
+            let (gx, gy) = (ear + body_w - CARD_MARGIN * s - d / 2.0, strip_c);
+            cx.c.fill_ellipse(gx - d / 2.0, gy - d / 2.0, d, d, cx.a(if cx.hovered(Hit::Settings) { CARD_HOVER } else { CARD }));
+            cx.icon(Icon::Gear, (gx - d / 2.0, gy - d / 2.0, d, d), 13.0, if cx.hovered(Hit::Settings) { 0xFFFFFFFF } else { DIM });
+            cx.hit((gx - d / 2.0, gy - d / 2.0, d, d), Hit::Settings);
 
-            let y0 = ch + ((h - ch) - CONTENT_H * s) / 2.0 - 2.0 * s;
-            let y0 = y0.max(ch + 4.0 * s);
+            let y0 = ch + ((h - ch) - CONTENT_H * s) / 2.0 + 1.0 * s;
+            let y0 = y0.max(ch + (CARD_PAD + 3.0) * s);
             match tab {
                 Tab::Media => {
                     let src = source.as_ref().and_then(|(_, v)| v.as_ref());
@@ -1392,6 +1490,85 @@ pub fn redraw(hwnd: HWND) {
         st.source = source;
     });
     sync_tick(hwnd);
+}
+
+/// Simpan gambar notch dalam tiap keadaan (ringkas, tiap tab, tiap jenis kartu) ke `dir`.
+/// `scale` menimpa skala monitor (mis. 2.0 untuk gambar tajam); `prefix` = awalan nama file.
+pub fn shots(hwnd: HWND, dir: &std::path::Path, scale: Option<f32>, prefix: &str) {
+    let Some((x0, tab0, open0, scale0)) = with(hwnd, |st| (st.x, st.tab, st.target_open, st.mon.scale)) else { return };
+    if notif_active(hwnd) {
+        return;
+    }
+    if let Some(k) = scale {
+        with(hwnd, |st| {
+            st.mon.scale = k;
+            st.canvas = None;
+        });
+    }
+    let shot = |name: &str| {
+        crate::canvas::capture_next(dir.join(format!("{prefix}-{name}.png")));
+        redraw(hwnd);
+    };
+    with(hwnd, |st| {
+        st.x = 0.0;
+        st.target_open = false;
+    });
+    shot("compact");
+    for t in tabs() {
+        with(hwnd, |st| {
+            st.x = 1.0;
+            st.target_open = true;
+            st.tab = t;
+            st.hover_hit = None;
+        });
+        shot(&format!("{t:?}").to_lowercase());
+    }
+    with(hwnd, |st| {
+        st.x = 0.0;
+        st.target_open = false;
+    });
+    let mut call = Toast::message("WhatsApp", "Prince", tr("Panggilan suara masuk", "Incoming voice call"));
+    call.actions = vec!["Tolak".into(), "Terima".into()];
+    call.kind = Kind::Call;
+    let mut bt = Toast::message("Bluetooth", "AirBuds Pro", "");
+    bt.kind = Kind::Bluetooth { battery: Some(70), audio: true };
+    let mut ch = Toast::message("", tr("Mengisi daya", "Charging"), tr("Pengisi daya tersambung", "Charger connected"));
+    ch.kind = Kind::Charging { pct: 80 };
+    let samples = [
+        ("message", Toast::message("WhatsApp", "Design Team", tr("Rina: Mockup v2 sudah siap direview 🎉", "Rina: Mockup v2 is ready for review 🎉"))),
+        ("message2", Toast::message("Microsoft Edge", tr("Unduhan selesai", "Download complete"), "HolmBar-Setup-0.2.0.exe")),
+        ("call", call),
+        ("bluetooth", bt),
+        ("charging", ch),
+    ];
+    for (name, t) in samples {
+        with(hwnd, |st| {
+            let (img, badge) = toast_images(&t);
+            st.notif_tint = badge.as_ref().or(img.as_ref()).and_then(|i| i.tint());
+            st.notif_img = img;
+            st.notif_badge = badge;
+            st.notif = Some(t);
+            st.nt = 1.0;
+            st.n_target = true;
+            st.notif_at = Some(Instant::now());
+        });
+        shot(name);
+    }
+    with(hwnd, |st| {
+        st.notif = None;
+        st.notif_img = None;
+        st.notif_badge = None;
+        st.nt = 0.0;
+        st.n_target = false;
+        st.x = x0;
+        st.tab = tab0;
+        st.target_open = open0;
+        st.mon.scale = scale0;
+        if scale.is_some() {
+            st.canvas = None;
+        }
+    });
+    redraw(hwnd);
 }
 
 fn start_anim(hwnd: HWND, open: bool) {
@@ -1453,6 +1630,7 @@ fn step(hwnd: HWND) {
             with(hwnd, |st| {
                 st.notif = None;
                 st.notif_img = None;
+                st.notif_badge = None;
             });
             next = advance_notif(hwnd);
         }
@@ -1515,7 +1693,9 @@ fn click(hwnd: HWND, mx: f32, my: f32) {
                 None => activate(),
             },
             (Some(Hit::CallDecline), Some(t)) => {
-                if let Some(a) = t.action_like(DECLINE_WORDS) {
+                // Tombol tolak bisa bernama apa saja (mis. ikon tanpa label): cadangannya tombol selain Terima.
+                let accept = t.action_like(ACCEPT_WORDS).map(str::to_string);
+                if let Some(a) = t.action_like(DECLINE_WORDS).or_else(|| t.actions.iter().rev().find(|a| Some(a.as_str()) != accept.as_deref()).map(|s| s.as_str())) {
                     invoke_action(a);
                 }
             }
@@ -1639,7 +1819,10 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 st.hover_hit = None;
             });
             if notif_active(hwnd) {
-                with(hwnd, |st| st.hover = false);
+                with(hwnd, |st| {
+                    st.hover = false;
+                    st.notif_at = Some(Instant::now());
+                });
                 let dur = notif_duration(hwnd);
                 unsafe {
                     SetTimer(Some(hwnd), TIMER_NOTIF, dur, None);

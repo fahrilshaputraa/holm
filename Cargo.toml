@@ -1,7 +1,14 @@
 [package]
 name = "holm-bar"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+description = "Menu bar, notch (dynamic island), dan Dock bergaya macOS untuk Windows"
+repository = "https://github.com/fahrilshaputraa/holm"
+
+# Installer (HolmBar-Setup.exe) adalah crate terpisah; `cargo build` biasa hanya membangun aplikasinya.
+[workspace]
+members = [".", "installer"]
+default-members = ["."]
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
@@ -55,7 +62,8 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Shell_Common",
     "UI_Notifications",
     "UI_Notifications_Management",
-    "ApplicationModel"
+    "ApplicationModel",
+    "Win32_Storage_Packaging_Appx"
 ] }
 windows-core = "0.62.2"
 windows-numerics = "0.3.1"
@@ -67,9 +75,3 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
-
-
-
-
-
-

@@ -687,7 +687,7 @@ impl Canvas {
             rt.BeginDraw();
             brush.SetColor(&D2D1_COLOR_F { r: ch(16), g: ch(8), b: ch(0), a });
             let origin = windows_numerics::Vector2 { X: rect.0 - bl as f32, Y: rect.1 - bt as f32 };
-            rt.DrawTextLayout(origin, l, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            rt.DrawTextLayout(origin, l, &brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
             let _ = rt.EndDraw(None, None);
         }
     }
@@ -706,6 +706,9 @@ impl Canvas {
     pub fn present_size(&self, hwnd: HWND, pos: Option<(i32, i32)>, w: i32, h: i32) {
         unsafe {
             let _ = GdiFlush();
+            if let Some(path) = CAPTURE.with(|c| c.borrow_mut().take()) {
+                self.save_png(&path, w.clamp(1, self.w), h.clamp(1, self.h));
+            }
             let mut dst = pos.map(|(x, y)| POINT { x, y });
             let mut src = POINT { x: 0, y: 0 };
             let mut size = SIZE { cx: w.clamp(1, self.w), cy: h.clamp(1, self.h) };
@@ -726,6 +729,45 @@ impl Canvas {
                 Some(&blend),
                 ULW_ALPHA,
             );
+        }
+    }
+}
+
+thread_local! {
+    static CAPTURE: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
+}
+
+/// `present` berikutnya di thread ini juga menyimpan isi kanvas ke file PNG (dipakai `--shots`).
+pub fn capture_next(path: std::path::PathBuf) {
+    CAPTURE.with(|c| *c.borrow_mut() = Some(path));
+}
+
+pub fn capture_cancel() {
+    CAPTURE.with(|c| *c.borrow_mut() = None);
+}
+
+impl Canvas {
+    /// Salin sudut kiri-atas `w`×`h` kanvas ke jendela biasa (bukan layered), mis. di WM_PAINT.
+    pub fn blit(&self, hdc: HDC, w: i32, h: i32) {
+        unsafe {
+            let _ = GdiFlush();
+            let _ = BitBlt(hdc, 0, 0, w.min(self.w), h.min(self.h), Some(self.hdc_mem), 0, 0, SRCCOPY);
+        }
+    }
+
+    /// Simpan sudut kiri-atas `w`×`h` kanvas sebagai PNG beralpha.
+    pub fn save_png(&self, path: &std::path::Path, w: i32, h: i32) {
+        let Some(inner) = self.inner.as_ref() else { return };
+        // CLSID encoder PNG GDI+.
+        let png = windows::core::GUID::from_u128(0x557CF406_1A04_11D3_9A73_0000F81EF32E);
+        let file = wide(&path.to_string_lossy());
+        unsafe {
+            let mut part: *mut GpBitmap = null_mut();
+            // 0x0026200A = PixelFormat32bppARGB (alpha lurus, sesuai PNG).
+            if GdipCloneBitmapAreaI(0, 0, w, h, 0x0026_200A, inner.bitmap, &mut part).0 == 0 && !part.is_null() {
+                GdipSaveImageToFile(part as *mut GpImage, PCWSTR(file.as_ptr()), &png, std::ptr::null());
+                GdipDisposeImage(part as *mut GpImage);
+            }
         }
     }
 }

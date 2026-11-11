@@ -137,6 +137,20 @@ fn app_name_for(cfg: &Config, hwnd: HWND) -> Option<String> {
         if stem.eq_ignore_ascii_case("explorer") {
             return Some(cfg.bar.desktop_label.clone());
         }
+        // Aplikasi UWP berjalan di dalam ApplicationFrameHost: nama aplikasinya = judul jendelanya.
+        if stem.eq_ignore_ascii_case("ApplicationFrameHost") {
+            let mut t = [0u16; 128];
+            let n = GetWindowTextW(hwnd, &mut t).max(0) as usize;
+            let title = String::from_utf16_lossy(&t[..n]);
+            if !title.trim().is_empty() {
+                return Some(title.trim().to_string());
+            }
+        }
+        // Nama produk dari exe ("Microsoft Edge", bukan "Msedge"); deskripsi yang terlalu panjang diabaikan.
+        let nice = crate::dock::friendly_name(&path);
+        if !nice.is_empty() && nice.chars().count() <= 32 {
+            return Some(nice);
+        }
         let mut c = stem.chars();
         Some(c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or(stem))
     }
@@ -193,6 +207,17 @@ pub fn remove(hwnd: HWND) {
     }
 }
 
+/// Paksa nama aplikasi aktif yang tampil di bar (untuk tangkapan dokumentasi).
+pub fn set_app_name(name: &str) {
+    APP.with(|a| *a.borrow_mut() = name.to_string());
+}
+
+/// Gambar ulang walau tidak ada yang berubah (mis. untuk tangkapan layar).
+pub fn force_redraw(hwnd: HWND) {
+    with_win(hwnd, |win| win.sig.clear());
+    redraw(hwnd);
+}
+
 pub fn redraw(hwnd: HWND) {
     let cfg = config::current();
     let bat = battery();
@@ -201,13 +226,14 @@ pub fn redraw(hwnd: HWND) {
     let Some((w, h, s)) = with_win(hwnd, |win| (win.width, win.height, win.mon.scale)) else { return };
     let vol = crate::status::volume();
     let wifi = crate::status::wifi();
-    let sig = format!("{app}|{clock}|{bat:?}|{vol:?}|{wifi:?}|{w}x{h}x{s}|t{}", crate::tray::revision());
+    let sig = format!("{app}|{clock}|{bat:?}|{vol:?}|{wifi:?}|{w}x{h}x{s}|t{}|{}", crate::tray::revision(), cfg.bar.transparent);
     if with_win(hwnd, |win| win.sig == sig).unwrap_or(true) {
         return;
     }
     let Some(c) = Canvas::new(w, h) else { return };
 
-    let bg = config::with_alpha(config::color(&cfg.bar.background), cfg.bar.opacity);
+    let transparent = cfg.bar.transparent;
+    let bg = if transparent { 0 } else { config::with_alpha(config::color(&cfg.bar.background), cfg.bar.opacity) };
     let text = config::color(&cfg.bar.text);
     let dim = config::color(&cfg.bar.dim_text);
     let fs = cfg.bar.font_size * s;
@@ -216,8 +242,22 @@ pub fn redraw(hwnd: HWND) {
     let icon = Font::new(&cfg.bar.icon_font, 14.0 * s, false);
     let fh = h as f32;
 
-    c.fill_rect(0.0, 0.0, w as f32, fh, bg);
-    c.fill_rect(0.0, fh - 1.0, w as f32, 1.0, 0x33FF_FFFF);
+    if transparent {
+        // Tembus pandang: hanya bayangan tipis dari atas agar teks terbaca di wallpaper terang.
+        // Alpha minimal 1/255 di seluruh bar: piksel yang sepenuhnya transparan tidak menerima klik.
+        c.fill_rect(0.0, 0.0, w as f32, fh, 0x0100_0000);
+        c.fill_gradient(0.0, 0.0, w as f32, fh, (0.0, 0.0, 0.0, 0.0), 0x5200_0000, 0x0A00_0000, false);
+    } else {
+        c.fill_rect(0.0, 0.0, w as f32, fh, bg);
+        c.fill_rect(0.0, fh - 1.0, w as f32, 1.0, 0x33FF_FFFF);
+    }
+    // Teks bar; pada mode transparan diberi bayangan 1 px.
+    let label = |t: &str, f: &Font, r: (f32, f32, f32, f32), col: u32| {
+        if transparent {
+            c.text(t, f, (r.0, r.1 + 1.0 * s, r.2, r.3), 0x9900_0000, Align::Near);
+        }
+        c.text(t, f, r, col, Align::Near);
+    };
 
     let mut hits: Vec<Hit> = Vec::new();
 
@@ -235,7 +275,7 @@ pub fn redraw(hwnd: HWND) {
         size
     } else {
         let lw = c.measure(&cfg.bar.logo, &icon);
-        c.text(&cfg.bar.logo, &icon, (x, 0.0, lw + 4.0, fh), text, Align::Near);
+        label(&cfg.bar.logo, &icon, (x, 0.0, lw + 4.0, fh), text);
         lw
     };
     hits.push(Hit { x0: x - 8.0 * s, x1: x + lw + 8.0 * s, action: Action::StartMenu });
@@ -243,12 +283,12 @@ pub fn redraw(hwnd: HWND) {
 
     let name = if app.is_empty() { cfg.bar.desktop_label.clone() } else { app };
     let nw = c.measure(&name, &bold).min(220.0 * s);
-    c.text(&name, &bold, (x, 0.0, nw + 4.0, fh), text, Align::Near);
+    label(&name, &bold, (x, 0.0, nw + 4.0, fh), text);
     x += nw + 16.0 * s;
 
     for (i, m) in cfg.bar.menus.iter().enumerate() {
         let mw = c.measure(m, &font);
-        c.text(m, &font, (x, 0.0, mw + 4.0, fh), dim, Align::Near);
+        label(m, &font, (x, 0.0, mw + 4.0, fh), dim);
         hits.push(Hit { x0: x - 8.0 * s, x1: x + mw + 8.0 * s, action: Action::AppMenu(i) });
         x += mw + 16.0 * s;
     }
@@ -282,14 +322,14 @@ pub fn redraw(hwnd: HWND) {
             }
             "clock" => {
                 let cw = c.measure(&clock, &bold);
-                c.text(&clock, &bold, (rx - cw, 0.0, cw + 4.0, fh), text, Align::Near);
+                label(&clock, &bold, (rx - cw, 0.0, cw + 4.0, fh), text);
                 (cw, Some(Action::Popup(crate::popup::Kind::Calendar)))
             }
             "battery" => match bat {
                 Some((pct, charging)) => {
-                    let label = format!("{pct}%");
-                    let lw = c.measure(&label, &font);
-                    c.text(&label, &font, (rx - lw, 0.0, lw + 4.0, fh), text, Align::Near);
+                    let pct_text = format!("{pct}%");
+                    let lw = c.measure(&pct_text, &font);
+                    label(&pct_text, &font, (rx - lw, 0.0, lw + 4.0, fh), text);
                     let (bw, bh) = (22.0 * s, 11.0 * s);
                     let bx = rx - lw - 6.0 * s - bw - 2.0 * s;
                     let by = (fh - bh) / 2.0;
@@ -347,7 +387,7 @@ pub fn redraw(hwnd: HWND) {
                     (0.0, None)
                 } else {
                     let gw = c.measure(glyph, &icon);
-                    c.text(glyph, &icon, (rx - gw, 0.0, gw + 4.0, fh), color, Align::Near);
+                    label(glyph, &icon, (rx - gw, 0.0, gw + 4.0, fh), color);
                     (gw, Some(act))
                 }
             }

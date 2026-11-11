@@ -119,7 +119,8 @@ const SECTIONS: &[Section] = &[
                 title: "Tampilan",
                 fields: &[
                     f("bar", "height", "Tinggi", "", int(20.0, 64.0, 1.0, "px")),
-                    f("bar", "opacity", "Opasitas latar", "", num(0.2, 1.0, 0.05, "%")),
+                    f("bar", "transparent", "Latar transparan", "Bar tembus pandang; teks diberi bayangan", Kind::Toggle),
+                    f("bar", "opacity", "Opasitas latar", "Dipakai saat latar tidak transparan", num(0.2, 1.0, 0.05, "%")),
                     f("bar", "background", "Warna latar", "", Kind::Color),
                     f("bar", "text", "Warna teks", "", Kind::Color),
                 ],
@@ -393,7 +394,7 @@ pub fn register() {
             lpfnWndProc: Some(wndproc),
             hInstance: hmod.into(),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+            hIcon: LoadIconW(Some(hmod.into()), PCWSTR(1 as *const u16)).or_else(|_| LoadIconW(None, IDI_APPLICATION)).unwrap_or_default(),
             lpszClassName: CLASS,
             ..Default::default()
         };

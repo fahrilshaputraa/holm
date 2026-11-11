@@ -25,6 +25,9 @@ pub const WM_APPBAR_DOCK: u32 = WM_USER + 102;
 
 const TIMER_ANIM: usize = 1;
 const TIMER_POLL: usize = 2;
+/// Jeda kursor diam di atas ikon sebelum daftar jendelanya muncul.
+const TIMER_HOVER: usize = 3;
+const HOVER_MS: u32 = 420;
 const FRAME_MS: u32 = 16;
 const POLL_MS: u32 = 40;
 /// Konstanta waktu peluruhan magnifikasi (detik); lebih kecil = lebih tajam.
@@ -177,9 +180,34 @@ fn window_aumid(hwnd: HWND) -> String {
         return c;
     }
     use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
-    let s = unsafe { SHGetPropertyStoreForWindow::<IPropertyStore>(hwnd) }.map(|st| aumid_from_store(&st)).unwrap_or_default().to_lowercase();
+    let mut s = unsafe { SHGetPropertyStoreForWindow::<IPropertyStore>(hwnd) }.map(|st| aumid_from_store(&st)).unwrap_or_default().to_lowercase();
+    if s.is_empty() {
+        // Aplikasi paket non-UWP (WhatsApp, Copilot, ...): AUMID milik prosesnya, agar cocok dengan pin taskbar.
+        s = process_aumid(hwnd).to_lowercase();
+    }
     AUMIDS.with(|a| a.borrow_mut().insert(key, s.clone()));
     s
+}
+
+/// AppUserModelID paket milik proses jendela ini (kosong untuk aplikasi biasa).
+fn process_aumid(hwnd: HWND) -> String {
+    use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
+    unsafe {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 {
+            return String::new();
+        }
+        let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return String::new() };
+        let mut buf = [0u16; 256];
+        let mut len = buf.len() as u32;
+        let r = GetApplicationUserModelId(h, &mut len, Some(windows::core::PWSTR(buf.as_mut_ptr())));
+        let _ = CloseHandle(h);
+        if r != ERROR_SUCCESS || len < 2 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&buf[..len as usize - 1])
+    }
 }
 
 fn exe_path_uncached(pid: u32) -> Option<String> {
@@ -348,13 +376,133 @@ struct Pin {
     aumid: String,
 }
 
+thread_local! {
+    /// Sidik jari blob pin terakhir yang dibaca, untuk mendeteksi pin/unpin di taskbar Windows.
+    static PINS_SIG: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Isi `Taskband\Favorites`: daftar pin taskbar yang sebenarnya, termasuk aplikasi Store/paket
+/// (yang tidak punya shortcut di folder "User Pinned\TaskBar") dan urutan tampilnya.
+fn favorites_blob() -> Option<Vec<u8>> {
+    use windows::core::w;
+    use windows::Win32::System::Registry::*;
+    unsafe {
+        let key = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Taskband");
+        let mut size = 0u32;
+        RegGetValueW(HKEY_CURRENT_USER, key, w!("Favorites"), RRF_RT_REG_BINARY, None, None, Some(&mut size)).ok().ok()?;
+        if size == 0 || size > 4 << 20 {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        RegGetValueW(HKEY_CURRENT_USER, key, w!("Favorites"), RRF_RT_REG_BINARY, None, Some(buf.as_mut_ptr() as *mut _), Some(&mut size)).ok().ok()?;
+        buf.truncate(size as usize);
+        Some(buf)
+    }
+}
+
+fn favorites_sig() -> u64 {
+    favorites_blob().map(|b| b.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ *x as u64).wrapping_mul(0x100000001b3))).unwrap_or(0)
+}
+
+/// True bila pin taskbar Windows berubah sejak terakhir dibaca (cache dibuang agar Dock ikut berubah).
+fn pins_changed() -> bool {
+    if !config::current().dock.import_taskbar_pins || TB_PINS.with(|p| p.borrow().is_none()) {
+        return false;
+    }
+    let changed = favorites_sig() != PINS_SIG.with(|s| s.get());
+    if changed {
+        reset_pins();
+    }
+    changed
+}
+
+/// Potong blob Favorites menjadi PIDL absolut: tiap entri = 1 byte tipe + u32 panjang + PIDL; 0xFF = akhir.
+fn favorites_entries(blob: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 5 <= blob.len() && blob[i] != 0xFF {
+        let size = u32::from_le_bytes([blob[i + 1], blob[i + 2], blob[i + 3], blob[i + 4]]) as usize;
+        let (start, end) = (i + 5, i + 5 + size);
+        if size < 2 || end > blob.len() {
+            break;
+        }
+        out.push(&blob[start..end]);
+        i = end;
+    }
+    out
+}
+
+/// Item pertama PIDL = folder virtual shell:AppsFolder {4234d49b-0245-4df3-b780-3893943456e1}?
+fn is_apps_folder_pidl(pidl: &[u8]) -> bool {
+    const APPS_FOLDER: [u8; 16] = [0x9b, 0xd4, 0x34, 0x42, 0x45, 0x02, 0xf3, 0x4d, 0xb7, 0x80, 0x38, 0x93, 0x94, 0x34, 0x56, 0xe1];
+    pidl.len() > 20 && pidl[4..20] == APPS_FOLDER
+}
+
+fn pins_from_favorites(blob: &[u8]) -> Vec<Pin> {
+    use windows::Win32::System::Com::*;
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    let mut out: Vec<Pin> = Vec::new();
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+    for entry in favorites_entries(blob) {
+        // Salin ke buffer sendiri dengan terminator ganda agar PIDL yang rusak tidak terbaca melewati batas.
+        let mut buf = entry.to_vec();
+        buf.extend_from_slice(&[0, 0, 0, 0]);
+        let name = unsafe {
+            match SHGetNameFromIDList(buf.as_ptr() as *const ITEMIDLIST, SIGDN_DESKTOPABSOLUTEPARSING) {
+                Ok(p) => {
+                    let s = p.to_string().unwrap_or_default();
+                    CoTaskMemFree(Some(p.0 as *const _));
+                    s
+                }
+                Err(_) => continue,
+            }
+        };
+        let pin = if name.to_lowercase().ends_with(".lnk") {
+            let f = std::path::Path::new(&name);
+            if !f.exists() {
+                continue;
+            }
+            let label = f.file_stem().map(|s| s.to_string_lossy().to_string());
+            let (target, aumid) = resolve_lnk(f);
+            let mut target = target.filter(|t| std::path::Path::new(t).exists());
+            if target.is_none() && label.as_deref() == Some("File Explorer") {
+                target = std::env::var("SystemRoot").ok().map(|r| format!(r"{r}\explorer.exe"));
+            }
+            Pin { path: target.unwrap_or(name), label, aumid }
+        } else if is_apps_folder_pidl(entry) {
+            // Aplikasi Store/paket: nama parsing item shell:AppsFolder = AppUserModelID-nya.
+            let id = name.rsplit('\\').next().unwrap_or("");
+            if id.is_empty() {
+                continue;
+            }
+            Pin { path: format!("shell:AppsFolder\\{id}"), label: appsfolder_name(id), aumid: id.to_lowercase() }
+        } else if std::path::Path::new(&name).exists() {
+            Pin { path: name, label: None, aumid: String::new() }
+        } else {
+            continue;
+        };
+        if !out.iter().any(|p| p.path.eq_ignore_ascii_case(&pin.path) || (!pin.aumid.is_empty() && p.aumid == pin.aumid)) {
+            out.push(pin);
+        }
+    }
+    out
+}
+
 /// Aplikasi yang di-pin di taskbar Windows: (path untuk dijalankan/dicocokkan, nama tampilan).
 /// Yang punya target .exe memakai exe itu (agar status "berjalan" cocok); aplikasi Store memakai .lnk-nya.
 fn taskbar_pins() -> Vec<Pin> {
     if let Some(c) = TB_PINS.with(|p| p.borrow().clone()) {
         return c;
     }
-    let mut out = Vec::new();
+    // Sumber utama: registry Taskband (urutan asli + aplikasi Store). Folder shortcut hanya cadangan.
+    let mut out = favorites_blob().map(|b| pins_from_favorites(&b)).unwrap_or_default();
+    PINS_SIG.with(|s| s.set(favorites_sig()));
+    if !out.is_empty() {
+        TB_PINS.with(|p| *p.borrow_mut() = Some(out.clone()));
+        return out;
+    }
     if let Ok(appdata) = std::env::var("APPDATA") {
         let dir = std::path::Path::new(&appdata).join(r"Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar");
         let mut files: Vec<_> = std::fs::read_dir(dir)
@@ -483,10 +631,78 @@ fn shell_icon(path: &str) -> Option<Image> {
     }
 }
 
-/// Ikon aplikasi paket (UWP/Store) dari shell:AppsFolder berdasarkan AppUserModelID.
+/// Skor sebuah varian file logo paket (lebih besar = lebih baik); None = jangan dipakai.
+/// Meniru taskbar Windows 11: utamakan `altform-unplated` (tanpa plat latar) berukuran `targetsize` terdekat
+/// ke 96 px; tema kontras tinggi dan varian untuk latar terang dilewati.
+fn logo_variant_score(file_lower: &str) -> Option<i32> {
+    if file_lower.contains("contrast-") || file_lower.contains("lightunplated") || file_lower.contains("theme-light") {
+        return None;
+    }
+    let num_after = |key: &str| -> Option<i32> {
+        let i = file_lower.find(key)? + key.len();
+        let digits: String = file_lower[i..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse().ok()
+    };
+    let mut score = 0;
+    if file_lower.contains("altform-unplated") {
+        score += 10_000;
+    }
+    if let Some(px) = num_after("targetsize-") {
+        // Cukup besar untuk Dock (>= 64) diutamakan; di atas itu, yang paling dekat ke 96.
+        score += if px >= 64 { 5_000 - (px - 96).abs().min(400) } else { 1_000 + px };
+    } else if let Some(sc) = num_after("scale-") {
+        score += 500 + sc.min(400);
+    }
+    Some(score)
+}
+
+/// Logo asli aplikasi paket (Store/MSIX) langsung dari folder instalasinya, tanpa plat latar.
+/// None untuk aplikasi desktop biasa atau paket yang tidak menyediakan varian tanpa plat.
+fn package_logo(aumid: &str) -> Option<Image> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{IShellItem2, SHCreateItemFromParsingName};
+    const PKEY_PACKAGE_INSTALL_PATH: PROPERTYKEY = PROPERTYKEY { fmtid: windows::core::GUID::from_u128(0x9F4C2855_9F79_4B39_A8D0_E1D42DE1D5F3), pid: 15 };
+    const PKEY_TILES_SMALL_LOGO_PATH: PROPERTYKEY = PROPERTYKEY { fmtid: windows::core::GUID::from_u128(0x86D40B4D_9069_443C_819A_2A54090DCCEC), pid: 2 };
+    let (install, logo) = unsafe {
+        let name: Vec<u16> = format!("shell:AppsFolder\\{aumid}").encode_utf16().chain(std::iter::once(0)).collect();
+        let item: IShellItem2 = SHCreateItemFromParsingName(PCWSTR(name.as_ptr()), None).ok()?;
+        let get = |key: &PROPERTYKEY| -> Option<String> {
+            let p = item.GetString(key).ok()?;
+            let s = p.to_string().ok();
+            CoTaskMemFree(Some(p.0 as *const _));
+            s.filter(|s| !s.is_empty())
+        };
+        (get(&PKEY_PACKAGE_INSTALL_PATH)?, get(&PKEY_TILES_SMALL_LOGO_PATH)?)
+    };
+    let base = std::path::Path::new(&install).join(&logo);
+    let dir = base.parent()?;
+    let stem = base.file_stem()?.to_string_lossy().to_lowercase();
+    let ext = base.extension()?.to_string_lossy().to_lowercase();
+    // Varian bernama "<stem>.<kualifikasi>.<ext>" di folder yang sama (atau "<stem>.<ext>" polos).
+    let best = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().to_lowercase();
+            let rest = n.strip_prefix(&stem)?.strip_suffix(&ext)?;
+            (rest.starts_with('.') && rest.ends_with('.')).then(|| logo_variant_score(&n).map(|s| (s, e.path()))).flatten()
+        })
+        .max_by_key(|(s, _)| *s)?;
+    // Tanpa varian "unplated", logo dirancang untuk plat berwarna: biarkan shell yang menggambarnya.
+    if best.0 < 10_000 {
+        return None;
+    }
+    Image::from_bytes(&std::fs::read(best.1).ok()?)
+}
+
+/// Ikon aplikasi dari shell:AppsFolder berdasarkan AppUserModelID: logo paket tanpa plat bila ada,
+/// selain itu ikon shell ukuran jumbo.
 fn appsfolder_icon(aumid: &str) -> Option<Image> {
     use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
     const SHIL_JUMBO: i32 = 4;
+    if let Some(img) = package_logo(aumid) {
+        return Some(img);
+    }
     unsafe {
         let name = wide260(&format!("shell:AppsFolder\\{aumid}"));
         let mut pidl: *mut windows::Win32::UI::Shell::Common::ITEMIDLIST = std::ptr::null_mut();
@@ -503,6 +719,23 @@ fn appsfolder_icon(aumid: &str) -> Option<Image> {
         let _ = DestroyIcon(icon);
         img
     }
+}
+
+thread_local! {
+    static AUMID_ICONS: RefCell<HashMap<String, Option<Image>>> = RefCell::new(HashMap::new());
+}
+
+/// Ikon asli aplikasi (96 px) dari AppUserModelID-nya, di-cache. Dipakai kartu notifikasi di notch.
+pub fn aumid_icon(aumid: &str) -> Option<Image> {
+    let key = aumid.to_lowercase();
+    AUMID_ICONS.with(|c| {
+        let mut c = c.borrow_mut();
+        if !c.contains_key(&key) {
+            let img = appsfolder_icon(aumid).map(|i| i.resized(96).unwrap_or(i));
+            c.insert(key.clone(), img);
+        }
+        c.get(&key).and_then(|i| i.as_ref()).and_then(|i| i.resized(96))
+    })
 }
 
 /// Nama tampilan aplikasi paket dari shell:AppsFolder.
@@ -528,7 +761,7 @@ thread_local! {
 }
 
 /// Deskripsi file exe (mis. "Microsoft Edge" untuk msedge.exe), jatuh ke nama file bila tak ada.
-fn friendly_name(path: &str) -> String {
+pub(crate) fn friendly_name(path: &str) -> String {
     use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
     if let Some(n) = NAMES.with(|c| c.borrow().get(path).cloned()) {
         return n;
@@ -565,7 +798,7 @@ fn friendly_name(path: &str) -> String {
 fn load_icon(item: &Item) -> Option<Image> {
     // Aplikasi UWP: ikon sebenarnya dari AppsFolder (ikon jendela ApplicationFrameHost sering generik).
     // Pin Store (.lnk tanpa target exe) memakai AUMID dari shortcut taskbar; yang berjalan memakai AUMID jendela.
-    let packaged = item.icon_hwnd.is_some() || item.path.to_lowercase().ends_with(".lnk") || item.path.to_lowercase().starts_with("shell:appsfolder");
+    let packaged = item.icon_hwnd.is_some() || item.aumid.contains('!') || item.path.to_lowercase().ends_with(".lnk") || item.path.to_lowercase().starts_with("shell:appsfolder");
     if packaged && !item.aumid.is_empty() {
         if let Some(img) = appsfolder_icon(&item.aumid) {
             return Some(img);
@@ -891,6 +1124,7 @@ pub fn remove(hwnd: HWND) {
 pub fn refresh(docks: &[HWND], fg: Option<HWND>) {
     let active_now = fg.map(|f| f.0 as isize).unwrap_or_else(|| unsafe { GetForegroundWindow() }.0 as isize);
     let active_changed = ACTIVE.with(|a| a.replace(active_now)) != active_now;
+    pins_changed(); // pin/unpin di taskbar Windows langsung tercermin di Dock
     let new_items = collect_items();
     // Bounce selesai saat aplikasinya sudah punya jendela (atau menyerah).
     BOUNCE.with(|b| {
@@ -1213,6 +1447,58 @@ fn activate(item: &Item) {
     }
 }
 
+/// Buka Start Menu Windows asli (pencarian, Pinned, Recent) dengan menekan tombol Win, lalu geser jendelanya
+/// ke atas Dock agar Dock tidak tertimpa (Windows menaruhnya rapat ke tepi bawah layar karena taskbar tersembunyi).
+fn open_start_menu(dock: HWND) {
+    let mk = |up: bool| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VK_LWIN, wScan: 0, dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) }, time: 0, dwExtraInfo: 0 } },
+    };
+    unsafe {
+        SendInput(&[mk(false), mk(true)], std::mem::size_of::<INPUT>() as i32);
+    }
+    let Some((_, py, _, _)) = pill_rect(dock) else { return };
+    let gap = with(dock, |w| (10.0 * w.mon.scale) as i32).unwrap_or(10);
+    let limit = py as i32 - gap; // Start Menu tidak boleh melewati garis ini
+    std::thread::spawn(move || {
+        // Animasi buka berlangsung ~300 ms dan shell bisa menempatkan ulang jendelanya: koreksi beberapa kali.
+        for delay in [120u64, 120, 150, 250] {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+            unsafe { raise_start_above(limit) };
+        }
+    });
+}
+
+unsafe fn raise_start_above(limit: i32) {
+    unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+        let found = unsafe { &mut *(lparam.0 as *mut Option<HWND>) };
+        if unsafe { IsWindowVisible(hwnd) }.as_bool() {
+            let mut pid = 0u32;
+            unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+            let exe = exe_path_uncached(pid).unwrap_or_default().to_lowercase();
+            if exe.ends_with("startmenuexperiencehost.exe") || exe.ends_with("searchhost.exe") {
+                let mut r = RECT::default();
+                if unsafe { GetWindowRect(hwnd, &mut r) }.is_ok() && r.right - r.left > 400 && r.bottom - r.top > 300 {
+                    *found = Some(hwnd);
+                    return windows::core::BOOL(0);
+                }
+            }
+        }
+        windows::core::BOOL(1)
+    }
+    let mut found: Option<HWND> = None;
+    unsafe {
+        let _ = EnumWindows(Some(cb), LPARAM(&mut found as *mut _ as isize));
+        let Some(h) = found else { return };
+        let mut r = RECT::default();
+        if GetWindowRect(h, &mut r).is_err() || r.bottom <= limit {
+            return;
+        }
+        let up = r.bottom - limit;
+        let _ = SetWindowPos(h, None, r.left, r.top - up, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
 fn launch(item: &Item) {
     let p: Vec<u16> = item.path.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
@@ -1223,7 +1509,7 @@ fn launch(item: &Item) {
 
 /// Entri `dock.pinned` di config untuk item ini (aplikasi Store -> aumid:ID, lainnya -> path exe).
 fn pin_entry(item: &Item) -> Option<String> {
-    if item.icon_hwnd.is_some() && !item.aumid.is_empty() {
+    if !item.aumid.is_empty() && (item.icon_hwnd.is_some() || item.aumid.contains('!')) {
         return Some(format!("aumid:{}", item.aumid));
     }
     (!item.path.is_empty() && !item.key.starts_with("uwp:")).then(|| item.path.clone())
@@ -1247,7 +1533,15 @@ fn item_menu(_owner: HWND, item: &Item) {
         let _ = GetCursorPos(&mut pt);
     }
     let running = !item.windows.is_empty();
-    let mut items = vec![crate::menu::MenuItem::new(if running { "Show" } else { "Open" }, "", 1)];
+    let mut items: Vec<crate::menu::MenuItem> = Vec::new();
+    // Seperti macOS: aplikasi dengan beberapa jendela mencantumkannya di atas menu.
+    if item.windows.len() > 1 {
+        for (i, &h) in item.windows.iter().enumerate().take(12) {
+            items.push(crate::menu::MenuItem::new(&window_label(HWND(h as *mut _)), "", 100 + i));
+        }
+        items.push(crate::menu::MenuItem::sep());
+    }
+    items.push(crate::menu::MenuItem::new(if running { "Show" } else { "Open" }, "", 1));
     if running {
         items.push(crate::menu::MenuItem::new("Close", "", 2));
     }
@@ -1284,8 +1578,87 @@ fn item_menu(_owner: HWND, item: &Item) {
                 }
             }
         }
+        n if n >= 100 => {
+            if let Some(&h) = item.windows.get(n - 100) {
+                focus_window(HWND(h as *mut _));
+            }
+        }
         _ => {}
     });
+}
+
+thread_local! {
+    /// Ikon yang sedang di-hover (dock dan kunci item), untuk daftar jendela saat hover.
+    static HOVER: RefCell<Option<(isize, String)>> = const { RefCell::new(None) };
+}
+
+/// Judul jendela untuk daftar (dipotong); awalan "-" untuk yang sedang diminimize.
+fn window_label(h: HWND) -> String {
+    let t = title(h);
+    let t = if t.trim().is_empty() { "(tanpa judul)".to_string() } else { t };
+    let t: String = if t.chars().count() > 52 { t.chars().take(51).chain(std::iter::once('\u{2026}')).collect() } else { t };
+    if unsafe { IsIconic(h) }.as_bool() { format!("\u{2014} {t}") } else { t }
+}
+
+fn focus_window(h: HWND) {
+    unsafe {
+        if IsIconic(h).as_bool() {
+            let _ = ShowWindow(h, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(h);
+    }
+}
+
+fn hover_stop(hwnd: HWND) {
+    HOVER.with(|h| *h.borrow_mut() = None);
+    unsafe {
+        let _ = KillTimer(Some(hwnd), TIMER_HOVER);
+    }
+}
+
+/// Mouse bergerak: bila berpindah ke ikon aplikasi yang punya >= 2 jendela, mulai hitung jeda tampil daftar.
+fn hover_track(hwnd: HWND, lparam: LPARAM) {
+    let (x, y) = (((lparam.0 & 0xFFFF) as i16) as f32, (((lparam.0 >> 16) & 0xFFFF) as i16) as f32);
+    let item = item_at(hwnd, x, y).and_then(|i| dock_items(hwnd).get(i).cloned());
+    let key = item.as_ref().filter(|it| !it.windows.is_empty() && it.key != START_KEY).map(|it| it.key.clone());
+    let same = HOVER.with(|h| h.borrow().as_ref().map(|(w, k)| *w == hwnd.0 as isize && Some(k) == key.as_ref()).unwrap_or(false));
+    if same {
+        return;
+    }
+    hover_stop(hwnd);
+    if let Some(k) = key {
+        HOVER.with(|h| *h.borrow_mut() = Some((hwnd.0 as isize, k)));
+        unsafe {
+            SetTimer(Some(hwnd), TIMER_HOVER, HOVER_MS, None);
+        }
+    }
+}
+
+fn hover_fire(hwnd: HWND) {
+    unsafe {
+        let _ = KillTimer(Some(hwnd), TIMER_HOVER);
+    }
+    let Some((_, key)) = HOVER.with(|h| h.borrow().clone()) else { return };
+    if crate::menu::is_open() {
+        return;
+    }
+    // Masih di atas ikon yang sama?
+    let mut pt = POINT::default();
+    let mut wr = RECT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+        let _ = GetWindowRect(hwnd, &mut wr);
+    }
+    let Some(i) = item_at(hwnd, (pt.x - wr.left) as f32, (pt.y - wr.top) as f32) else { return };
+    let Some(item) = dock_items(hwnd).get(i).cloned().filter(|it| it.key == key && !it.windows.is_empty()) else { return };
+    let Some((rx, ry, rw, _)) = with(hwnd, |w| w.rects.get(i).copied()).flatten() else { return };
+    let scale = with(hwnd, |w| w.mon.scale).unwrap_or(1.0);
+    let Some(mon) = with(hwnd, |w| w.mon) else { return };
+    let icon_top = wr.top + ry as i32;
+    let pill_top = pill_rect(hwnd).map(|p| p.1 as i32).unwrap_or(icon_top);
+    // Di atas ikon yang dibesarkan dan label namanya, supaya tidak menimpa keduanya.
+    let bottom = icon_top.min(pill_top) - (36.0 * scale) as i32;
+    crate::preview::show(&item.windows, wr.left + (rx + rw / 2.0) as i32, bottom, mon);
 }
 
 fn activate_first(item: &Item) {
@@ -1320,6 +1693,7 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 w.dirty = true;
             });
             track_leave(hwnd);
+            hover_track(hwnd, lparam);
             ensure_timer(hwnd);
             // Gambar langsung dari pesan mouse (dibatasi ~100 fps) agar gelombang terasa realtime;
             // sisanya dilanjutkan timer.
@@ -1329,6 +1703,7 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             LRESULT(0)
         }
         0x02A3 => {
+            hover_stop(hwnd);
             with(hwnd, |w| {
                 w.mouse_x = None;
                 w.tracking = false;
@@ -1341,8 +1716,9 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             let (x, y) = xy(lparam);
             if let Some(i) = item_at(hwnd, x, y) {
                 if let Some(it) = dock_items(hwnd).get(i).cloned() {
+                    crate::preview::hide();
                     if it.key == START_KEY {
-                        crate::popup::open_launcher();
+                        open_start_menu(hwnd);
                     } else if it.windows.is_empty() {
                         launch(&it);
                         ensure_timer(hwnd);
@@ -1353,7 +1729,20 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             }
             LRESULT(0)
         }
+        WM_MBUTTONUP => {
+            // Seperti taskbar: klik tengah membuka jendela/instance baru aplikasi itu.
+            let (x, y) = xy(lparam);
+            if let Some(it) = item_at(hwnd, x, y).and_then(|i| dock_items(hwnd).get(i).cloned()) {
+                if it.key != START_KEY {
+                    crate::preview::hide();
+                    launch(&it);
+                    ensure_timer(hwnd);
+                }
+            }
+            LRESULT(0)
+        }
         WM_RBUTTONUP => {
+            crate::preview::hide();
             let (x, y) = xy(lparam);
             match item_at(hwnd, x, y).and_then(|i| dock_items(hwnd).get(i).cloned()) {
                 Some(it) if it.key == START_KEY => {
@@ -1370,6 +1759,10 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         }
         WM_TIMER if wparam.0 == TIMER_ANIM => {
             step(hwnd);
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == TIMER_HOVER => {
+            hover_fire(hwnd);
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == TIMER_POLL => {
@@ -1418,4 +1811,42 @@ pub fn source_app(src: &str) -> Option<(String, Image)> {
     }
     let img = crate::popup::app_icon(&stem)?;
     Some((pretty_name(&stem), img))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn favorites_blob_is_split_into_pidls() {
+        // Dua entri (panjang 4 dan 2) lalu penanda akhir 0xFF; sisa sesudahnya diabaikan.
+        let blob = [0u8, 4, 0, 0, 0, 1, 2, 3, 4, 0, 2, 0, 0, 0, 9, 9, 0xFF, 7, 7];
+        let e = favorites_entries(&blob);
+        assert_eq!(e, vec![&[1u8, 2, 3, 4][..], &[9u8, 9][..]]);
+        // Panjang melebihi blob: berhenti tanpa panik.
+        assert!(favorites_entries(&[0, 200, 0, 0, 0, 1, 2]).is_empty());
+        assert!(favorites_entries(&[]).is_empty());
+    }
+
+    #[test]
+    fn apps_folder_pidl_is_detected_by_guid() {
+        let mut pidl = vec![0x14, 0x00, 0x1f, 0x80, 0x9b, 0xd4, 0x34, 0x42, 0x45, 0x02, 0xf3, 0x4d, 0xb7, 0x80, 0x38, 0x93, 0x94, 0x34, 0x56, 0xe1];
+        pidl.extend_from_slice(&[8, 0, 1, 2, 3, 4, 5, 6, 0, 0]);
+        assert!(is_apps_folder_pidl(&pidl));
+        pidl[5] ^= 0xFF;
+        assert!(!is_apps_folder_pidl(&pidl));
+        assert!(!is_apps_folder_pidl(&[0x14, 0x00]));
+    }
+
+    #[test]
+    fn unplated_logo_near_96px_wins() {
+        let s = |n: &str| logo_variant_score(n);
+        assert!(s("logo.targetsize-96_altform-unplated.png") > s("logo.targetsize-256_altform-unplated.png"));
+        assert!(s("logo.targetsize-256_altform-unplated.png") > s("logo.targetsize-32_altform-unplated.png"));
+        assert!(s("logo.targetsize-32_altform-unplated.png") > s("logo.targetsize-96.png"));
+        assert!(s("logo.targetsize-96.png") > s("logo.scale-200.png"));
+        assert_eq!(s("logo.targetsize-96_altform-lightunplated.png"), None);
+        assert_eq!(s("logo.contrast-black_targetsize-96.png"), None);
+        assert!(s("logo.scale-200.png").unwrap() < 10_000, "varian berplat tidak dipakai sebagai logo tanpa plat");
+    }
 }

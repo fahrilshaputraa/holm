@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod apps;
 mod bar;
 mod canvas;
 mod config;
@@ -16,6 +17,7 @@ mod monitors;
 mod notch;
 mod notifications;
 mod popup;
+mod preview;
 mod radios;
 mod settings;
 mod status;
@@ -28,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateMutexW, GetCurrentThreadId};
+use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, GetCurrentThreadId, TerminateProcess};
 use windows::Win32::UI::Accessibility::*;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT};
@@ -51,6 +53,53 @@ const WM_REBUILD: u32 = WM_APP + 10;
 const WM_OPEN_SETTINGS: u32 = WM_APP + 11;
 /// `holm-bar.exe --preview`: instance kedua meminta kartu contoh berikutnya di notch.
 const WM_PREVIEW: u32 = WM_APP + 13;
+/// Id timer thread untuk pemeriksaan layar penuh.
+static FS_TIMER: AtomicUsize = AtomicUsize::new(0);
+
+/// Jendela di depan menutupi seluruh monitornya (video/game/F11): bar, notch, dan Dock di monitor itu
+/// disembunyikan, dan ditampilkan lagi begitu tidak lagi layar penuh.
+fn update_fullscreen() {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return;
+        }
+        let mut cls = [0u16; 64];
+        let n = GetClassNameW(fg, &mut cls).max(0) as usize;
+        let cls = String::from_utf16_lossy(&cls[..n]);
+        // Jendela milik HolmBar / shell (menu Start, desktop) tidak mengubah keadaan.
+        if cls.starts_with("Holm") || matches!(cls.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "XamlExplorerHostIslandWindow" | "Windows.UI.Core.CoreWindow") {
+            return;
+        }
+        let hmon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let mut r = RECT::default();
+        let full = IsWindowVisible(fg).as_bool()
+            && !IsIconic(fg).as_bool()
+            && GetMonitorInfoW(hmon, &mut mi).as_bool()
+            && GetWindowRect(fg, &mut r).is_ok()
+            && r.left <= mi.rcMonitor.left
+            && r.top <= mi.rcMonitor.top
+            && r.right >= mi.rcMonitor.right
+            && r.bottom >= mi.rcMonitor.bottom;
+        for h in bars().into_iter().chain(notches()).chain(docks()) {
+            let same = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) == hmon;
+            let want_hidden = full && same;
+            let shown = IsWindowVisible(h).as_bool();
+            if want_hidden && shown {
+                let _ = ShowWindow(h, SW_HIDE);
+            } else if !want_hidden && !shown && (same || !full) {
+                let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+            }
+        }
+    }
+}
+
+/// Instance kedua dengan `--quit` (dipakai installer/uninstaller): keluar dengan rapi (taskbar dipulihkan).
+const WM_QUIT_APP: u32 = WM_APP + 14;
+/// Instance kedua dengan `--shots`: simpan gambar tiap komponen ke `%APPDATA%\HolmBar\shots` (untuk dokumentasi).
+const WM_SHOTS: u32 = WM_APP + 15;
 const IPC_CLASS: PCWSTR = w!("HolmBarIpcClass");
 
 static MAIN_TID: AtomicU32 = AtomicU32::new(0);
@@ -318,6 +367,45 @@ pub(crate) fn reload_config() {
     }
 }
 
+/// Simpan gambar bar, Dock, dan tiap keadaan notch sebagai PNG (latar transparan).
+fn shots() {
+    let dir = config::dir().join("shots");
+    let _ = std::fs::create_dir_all(&dir);
+    // Mode demo (ada demo-art.png di folder shots): media contoh + nama aplikasi netral, tanpa data pribadi.
+    let demo = std::fs::read(dir.join("demo-art.png")).ok();
+    if demo.is_some() {
+        media::set_demo(Some(("Midnight Drive", "Neon Harbor", demo.clone())));
+        bar::set_app_name(&config::current().bar.desktop_label);
+    }
+    for (i, h) in bars().into_iter().enumerate() {
+        canvas::capture_next(dir.join(format!("bar-{i}.png")));
+        bar::force_redraw(h);
+    }
+    for (i, h) in docks().into_iter().enumerate() {
+        canvas::capture_next(dir.join(format!("dock-{i}.png")));
+        dock::redraw(h);
+    }
+    if let Some(h) = notches().into_iter().next() {
+        notch::shots(h, &dir, None, "notch");
+        notch::shots(h, &dir, Some(2.0), "notch2x");
+    }
+    if let Some(mut mon) = monitors::all().into_iter().next() {
+        mon.scale = 2.0;
+        for (kind, name) in [(popup::Kind::Control, "control"), (popup::Kind::Calendar, "calendar"), (popup::Kind::Volume, "volume")] {
+            popup::shot(kind, mon, dir.join(format!("popup2x-{name}.png")), demo.is_some());
+        }
+    }
+    canvas::capture_cancel();
+    if demo.is_some() {
+        media::set_demo(None);
+        unsafe {
+            bar::on_foreground(GetForegroundWindow());
+        }
+        bars().into_iter().for_each(bar::force_redraw);
+        notches().into_iter().for_each(notch::redraw);
+    }
+}
+
 fn quit() {
     QUITTING.store(true, Ordering::SeqCst);
     tray::stop();
@@ -444,6 +532,14 @@ unsafe extern "system" fn ipc_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         handle_command(IDM_PREVIEW_NOTIF);
         return LRESULT(0);
     }
+    if msg == WM_QUIT_APP {
+        quit();
+        return LRESULT(0);
+    }
+    if msg == WM_SHOTS {
+        shots();
+        return LRESULT(0);
+    }
     if msg == WM_OPEN_SETTINGS {
         settings::open();
         return LRESULT(0);
@@ -507,7 +603,9 @@ fn handle_thread_message(msg: &MSG) {
             notches().into_iter().for_each(notch::redraw); // cuaca untuk animasi idle
             popup::on_status_changed();
         }
+        WM_TIMER if msg.wParam.0 == FS_TIMER.load(Ordering::Relaxed) => update_fullscreen(),
         WM_FOREGROUND => {
+            update_fullscreen();
             let fg = HWND(msg.lParam.0 as *mut _);
             if bar::on_foreground(fg) {
                 bars().into_iter().for_each(bar::redraw);
@@ -542,10 +640,22 @@ fn main() {
             // Sudah berjalan: menjalankan HolmBar lagi membuka jendela Pengaturan.
             if let Ok(h) = FindWindowExW(Some(HWND_MESSAGE), None, IPC_CLASS, PCWSTR::null()) {
                 let _ = AllowSetForegroundWindow(ASFW_ANY);
-                let m = if std::env::args().any(|a| a == "--preview") { WM_PREVIEW } else { WM_OPEN_SETTINGS };
+                let has = |f: &str| std::env::args().any(|a| a == f);
+                let m = if has("--preview") {
+                    WM_PREVIEW
+                } else if has("--quit") {
+                    WM_QUIT_APP
+                } else if has("--shots") {
+                    WM_SHOTS
+                } else {
+                    WM_OPEN_SETTINGS
+                };
                 let _ = PostMessageW(Some(h), m, WPARAM(0), LPARAM(0));
             }
             return;
+        }
+        if std::env::args().any(|a| a == "--quit") {
+            return; // tidak ada instance yang berjalan
         }
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         MAIN_TID.store(GetCurrentThreadId(), Ordering::Relaxed);
@@ -556,6 +666,7 @@ fn main() {
         canvas::startup();
         register_classes();
         settings::register();
+        preview::register();
         menu::register();
         create_ipc_window();
 
@@ -569,6 +680,7 @@ fn main() {
         let _h3 = SetWinEventHook(0x8017, 0x8018, None, Some(dock_hook), 0, 0, WINEVENT_OUTOFCONTEXT);
         // MOVESIZEEND (0x000B): jendela dipindah ke monitor lain -> Dock monitor itu diperbarui.
         let _h4 = SetWinEventHook(0x000B, 0x000B, None, Some(dock_hook), 0, 0, WINEVENT_OUTOFCONTEXT);
+        FS_TIMER.store(SetTimer(None, 0, 600, None), Ordering::Relaxed);
         let tid = GetCurrentThreadId();
         register_hotkey();
         media::start(tid);
@@ -578,6 +690,7 @@ fn main() {
         weather::set_city(&config::current().weather.city);
         weather::start(tid);
         tray::sync();
+        apps::refresh();
         if bar::on_foreground(GetForegroundWindow()) {
             bars().into_iter().for_each(bar::redraw);
         }
@@ -597,4 +710,10 @@ fn main() {
     }
     taskbar::restore();
     canvas::shutdown();
+    // Semua yang perlu dipulihkan sudah dipulihkan. Keluar seketika: penutupan normal menunggu thread latar
+    // (UI Automation, WinRT) dilepas satu per satu dan bisa makan beberapa detik, sehingga installer/uninstaller
+    // mengira HolmBar macet dan file exe masih terkunci.
+    unsafe {
+        let _ = TerminateProcess(GetCurrentProcess(), 0);
+    }
 }

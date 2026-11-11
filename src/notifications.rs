@@ -37,8 +37,10 @@ pub struct Toast {
     pub app: String,
     pub title: String,
     pub body: String,
-    /// Gambar banner (BMP) bila ada: avatar/logo.
+    /// Logo asli aplikasi pengirim dari UserNotificationListener (bila sudah diketahui).
     pub icon: Option<Vec<u8>>,
+    /// Gambar di dalam banner (BMP) bila ada: avatar kontak / gambar pesan.
+    pub image: Option<Vec<u8>>,
     /// Nama tombol aksi di banner aslinya (mis. "Accept", "Decline"); diklik lewat `invoke_action`.
     pub actions: Vec<String>,
     pub kind: Kind,
@@ -46,7 +48,7 @@ pub struct Toast {
 
 impl Toast {
     pub fn message(app: &str, title: &str, body: &str) -> Toast {
-        Toast { app: app.into(), title: title.into(), body: body.into(), icon: None, actions: Vec::new(), kind: Kind::Message }
+        Toast { app: app.into(), title: title.into(), body: body.into(), icon: None, image: None, actions: Vec::new(), kind: Kind::Message }
     }
 
     /// Tombol aksi yang cocok dengan salah satu kata kunci (huruf kecil).
@@ -181,6 +183,10 @@ fn logo_worker() {
                 if known || name.is_empty() {
                     continue;
                 }
+                // Nama -> AppUserModelID yang pasti benar: ikon resolusi tinggi diambil dari shell (apps.rs).
+                if let Ok(id) = n.AppInfo().and_then(|a| a.AppUserModelId()) {
+                    crate::apps::remember(&name, &id.to_string());
+                }
                 let logo = disp.GetLogo(windows::Foundation::Size { Width: 64.0, Height: 64.0 }).ok().and_then(read_ref);
                 dbg(&format!("logo: '{name}' -> {}", if logo.is_some() { "ada" } else { "tidak ada" }));
                 if let Ok(mut g) = LOGOS.lock() {
@@ -299,6 +305,15 @@ impl Scanner {
                     continue;
                 }
                 let img = self.image(win.CurrentProcessId().unwrap_or(0) as u32);
+                // Panggilan WhatsApp (dan sejenis) tampil sebagai jendela aplikasi sendiri, bukan banner toast:
+                // jendela kecil milik aplikasi pengirim yang punya tombol Terima/Accept.
+                if img.contains("whatsapp") || img.contains("telegram") || img.contains("signal") {
+                    let small = win.CurrentBoundingRectangle().map(|r| (1..=800).contains(&(r.right - r.left)) && (1..=800).contains(&(r.bottom - r.top))).unwrap_or(false);
+                    if small {
+                        self.read_toast(&win, &cond, true);
+                    }
+                    continue;
+                }
                 let host = match img.as_str() {
                     "shellexperiencehost.exe" | "shellhost.exe" => true,
                     // explorer.exe juga punya jendela biasa (folder): hanya host XAML/toast-nya yang dipindai.
@@ -326,13 +341,13 @@ impl Scanner {
                 if !bstr(e.CurrentAutomationId()).starts_with("NormalToastView") {
                     continue;
                 }
-                self.read_toast(&e, cond);
+                self.read_toast(&e, cond, false);
                 return;
             }
         }
     }
 
-    unsafe fn read_toast(&mut self, toast: &IUIAutomationElement, cond: &IUIAutomationCondition) {
+    unsafe fn read_toast(&mut self, toast: &IUIAutomationElement, cond: &IUIAutomationCondition, call_window: bool) {
         unsafe {
             let mut texts: Vec<String> = Vec::new();
             let mut actions: Vec<String> = Vec::new();
@@ -366,6 +381,13 @@ impl Scanner {
                     }
                 }
             }
+            if call_window {
+                dbg(&format!("jendela panggilan?: teks={texts:?} tombol={actions:?}"));
+            }
+            // Jendela panggilan: hanya dianggap bila ada tombol Terima; tanpa itu (jendela chat biasa) abaikan.
+            if call_window && !actions.iter().any(|a| ACCEPT_WORDS.iter().any(|w| a.to_lowercase().contains(w))) {
+                return;
+            }
             if texts.is_empty() {
                 let name = bstr(toast.CurrentName());
                 texts = name.split(['\r', '\n']).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
@@ -384,16 +406,16 @@ impl Scanner {
             self.seen.push((key, Instant::now()));
             self.last = Some(toast.clone());
 
+            // Ikon aplikasi dicari dari namanya di thread utama (apps.rs); di sini hanya logo listener + gambar banner.
+            let icon = logo_for(&app);
             // Tunggu animasi geser selesai agar gambar tidak terpotong, lalu salin pikselnya.
-            let icon = logo_for(&app).or_else(|| {
-                image.and_then(|im| {
-                    std::thread::sleep(Duration::from_millis(450));
-                    capture(im.CurrentBoundingRectangle().ok()?)
-                })
+            let image = image.and_then(|im| {
+                std::thread::sleep(Duration::from_millis(450));
+                capture(im.CurrentBoundingRectangle().ok()?)
             });
-            dbg(&format!("banner: app='{app}' judul='{title}' logo_asli={}", logo_for(&app).is_some()));
-            let kind = if is_call(&app, &title, &body, &actions) { Kind::Call } else { Kind::Message };
-            let t = Box::new(Toast { app, title, body, icon, actions, kind });
+            dbg(&format!("banner: app='{app}' judul='{title}' logo_listener={} gambar={} teks={}", icon.is_some(), image.is_some(), texts.len()));
+            let kind = if call_window || is_call(&app, &title, &body, &actions) { Kind::Call } else { Kind::Message };
+            let t = Box::new(Toast { app, title, body, icon, image, actions, kind });
             let _ = PostThreadMessageW(self.main_tid, WM_NOTIFY_TOAST, WPARAM(0), LPARAM(Box::into_raw(t) as isize));
         }
     }

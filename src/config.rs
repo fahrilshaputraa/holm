@@ -92,6 +92,8 @@ pub struct Bar {
     pub height: i32,
     pub background: String,
     pub opacity: f32,
+    /// Bar tanpa latar (tembus pandang ke wallpaper/jendela di belakangnya).
+    pub transparent: bool,
     pub text: String,
     pub dim_text: String,
     pub font: String,

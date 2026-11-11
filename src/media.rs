@@ -91,7 +91,31 @@ struct Hooked {
 }
 
 pub fn info() -> MediaInfo {
+    if let Some(d) = DEMO.lock().ok().and_then(|g| g.clone()) {
+        return d;
+    }
     INFO.lock().ok().and_then(|g| g.clone()).unwrap_or_default()
+}
+
+/// Media contoh yang menggantikan info asli selama tangkapan dokumentasi (`--shots`); None = kembali normal.
+static DEMO: Mutex<Option<MediaInfo>> = Mutex::new(None);
+
+pub fn set_demo(demo: Option<(&str, &str, Option<Vec<u8>>)>) {
+    let info = demo.map(|(title, artist, thumb)| MediaInfo {
+        active: true,
+        playing: true,
+        title: title.into(),
+        artist: artist.into(),
+        key: 1,
+        duration_ms: 245_000,
+        pos_ms: 83_000,
+        stamp: Instant::now(),
+        thumb: thumb.map(Arc::new),
+        source: String::new(),
+    });
+    if let Ok(mut g) = DEMO.lock() {
+        *g = info;
+    }
 }
 
 fn post() {
