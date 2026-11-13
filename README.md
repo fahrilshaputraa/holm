@@ -10,6 +10,7 @@
 ![Rust](https://img.shields.io/badge/built%20with-Rust-B7410E?logo=rust&logoColor=white)
 ![Version](https://img.shields.io/badge/version-0.2.0-8B5CF6)
 ![Size](https://img.shields.io/badge/installer-2%20MB-22C55E)
+[![License](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
 
 [Download](#install) · [Features](#features) · [Configuration](#configuration) · [Build from source](#build-from-source) · [Bahasa Indonesia](README.id.md)
 
@@ -195,3 +196,10 @@ cargo test --release
 | `src/canvas.rs`, `icons.rs` | Drawing layer (GDI+ shapes, DirectWrite text) and vector icons |
 | `installer/` | `HolmBar-Setup.exe` |
 | `tools/` | Icon, screenshot and installer scripts |
+
+## License
+
+HolmBar is free software, licensed under the **GNU General Public License v3.0**. See [`LICENSE`](LICENSE).
+
+Copyright (C) 2026 fahrilshaputraa. You may use, study, share and modify HolmBar; if you distribute a modified
+version, you must do so under the same license and make its source available.

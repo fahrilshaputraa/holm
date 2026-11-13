@@ -191,3 +191,10 @@ cargo test --release
 | `src/canvas.rs`, `icons.rs` | Lapisan gambar (bentuk GDI+, teks DirectWrite) dan ikon vektor |
 | `installer/` | `HolmBar-Setup.exe` |
 | `tools/` | Skrip ikon, tangkapan layar, dan installer |
+
+## Lisensi
+
+HolmBar adalah perangkat lunak bebas dengan lisensi **GNU General Public License v3.0**. Lihat [`LICENSE`](LICENSE).
+
+Hak cipta (C) 2026 fahrilshaputraa. Anda boleh memakai, mempelajari, membagikan, dan mengubah HolmBar; bila Anda
+mendistribusikan versi yang diubah, Anda wajib melakukannya dengan lisensi yang sama dan menyertakan kode sumbernya.

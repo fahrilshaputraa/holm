@@ -4,6 +4,7 @@ version = "0.2.0"
 edition = "2021"
 description = "Menu bar, notch (dynamic island), dan Dock bergaya macOS untuk Windows"
 repository = "https://github.com/fahrilshaputraa/holm"
+license = "GPL-3.0-only"
 
 # Installer (HolmBar-Setup.exe) adalah crate terpisah; `cargo build` biasa hanya membangun aplikasinya.
 [workspace]

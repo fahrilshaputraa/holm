@@ -3,6 +3,7 @@ name = "holm-setup"
 version = "0.2.0"
 edition = "2021"
 description = "Installer HolmBar (pasang per pengguna, tanpa hak administrator)"
+license = "GPL-3.0-only"
 build = "build.rs"
 
 [[bin]]
